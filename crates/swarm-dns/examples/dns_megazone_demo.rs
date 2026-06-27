@@ -40,7 +40,7 @@ use swarm_dns::dns_authority::{level_hash, pk_binding_hash, AuthorityKeypair, Ni
 
 type Ext = SexticExt;
 const BLOWUP: usize = 32;     // paper Table III: 1/ρ₀ = 32 calibration
-const NUM_QUERIES: usize = 54; // NIST L1 / q = 2^40
+const NUM_QUERIES: usize = 55; // NIST L1 / q = 2^40 (slack Johnson floor)
 const SEED_Z: u64 = 0xDEEF_BAAD;
 
 // ─────────────────────────────────────────────────────────────────────────────

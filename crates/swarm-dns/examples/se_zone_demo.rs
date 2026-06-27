@@ -1323,7 +1323,7 @@ async fn main() {
     let rsa_blowup: usize = std::env::var("RSA_BLOWUP")
         .ok().and_then(|s| s.parse().ok()).unwrap_or(4);
     let rsa_r_queries: usize = std::env::var("RSA_R_QUERIES")
-        .ok().and_then(|s| s.parse().ok()).unwrap_or(54);
+        .ok().and_then(|s| s.parse().ok()).unwrap_or(55);
 
     let mut sic_outputs: Vec<SicOutput> = Vec::new();
     if rsa_limit > 0 {
@@ -1831,7 +1831,7 @@ async fn main() {
         println!("    avg/sig:                              π={:>6.1} KiB  prove {:>6.0} ms  verify {:>5.1} ms",
             total_bytes as f64 / 1024.0 / n,
             total_prove / n, total_verify / n);
-        println!("    paper Tab. II RSA-2048 @ L1 production: ~95 s prove / sig (blowup=32, r=54)");
+        println!("    paper Tab. II RSA-2048 @ L1 production: ~95 s prove / sig (blowup=32, r=55)");
     }
     println!("  Merkle commitment R (32 B):  {}", hex::encode(&root[..16]));
     println!("  ML-DSA-65 epoch signature:   {} B", ml_dsa_65::SIG_LEN);

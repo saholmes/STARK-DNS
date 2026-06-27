@@ -146,7 +146,7 @@ fn prove_rsa2048_record(sig_idx: u64, blowup: usize) -> LegOutput {
     fill_rsa_stacked(&mut trace, &layout, n_trace, &records);
 
     let kk = rsa_stacked_constraints(&layout);
-    let r: usize = 54;
+    let r: usize = 55; // NIST L1 slack Johnson floor (blowup=32)
 
     let n0 = n_trace * blowup;
     let domain = FriDomain::new_radix2(n0);

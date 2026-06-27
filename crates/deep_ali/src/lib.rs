@@ -16,32 +16,41 @@ pub mod trace_import;
 /// query count needed to reach the target NIST PQ Level's IT
 /// soundness) and `NIST_LEVEL` (the named level: 1, 3, or 5).
 ///
-/// The Johnson-regime per-query rate is ½·log₂(1/ρ_0) ≈ 2.5 bits at
-/// ρ_0 = 1/32 (BCIKS / STIR Theorem 1, both proven unconditionally).
-/// The capacity-regime rate (~5 bits/query) is conjectural and not
-/// used here; see `feedback_stir_johnson_unconditional_only.md`.
+/// The Johnson-regime per-query rate is the η-included (slack) yield
+/// −log₂(√ρ_0 + η_0) ≈ 2.43 bits at ρ_0 = 1/32 with η_0 ≤ √ρ_0/20
+/// (BCIKS / STIR Theorem 1, both proven unconditionally); the ideal
+/// η=0 bound ½·log₂(1/ρ_0) = 2.5 b/q is the ESORICS-predecessor
+/// figure.  The capacity-regime rate (~5 bits/query) is conjectural
+/// and not used here; see `feedback_stir_johnson_unconditional_only.md`.
 ///
-/// |  Active feature  | NUM_QUERIES_LEVEL | NIST_LEVEL | IT bits |
-/// |------------------|--------------------|------------|----------|
-/// |  sha3-256        |  54                |  1         | 135      |
-/// |  sha3-384        |  79                |  3         | 197.5    |
-/// |  sha3-512        |  105               |  5         | 262.5    |
+/// |  Active feature  | NUM_QUERIES_LEVEL | NIST_LEVEL | kappa_sys |
+/// |------------------|--------------------|------------|-----------|
+/// |  sha3-256        |  55                |  1         | 128       |
+/// |  sha3-384        |  81                |  3         | 192       |
+/// |  sha3-512        |  108               |  5         | 256       |
+///
+/// Counts are the slack Johnson floor (2.43 b/q), so κ_sys lands
+/// exactly at the NIST floor.  This codebase deploys STIR and uses
+/// the slack floor throughout; the ideal-bound r=54/79/105 belongs
+/// to the ESORICS FRI predecessor.
 ///
 /// Downstream callers (mmiyc-prover/verifier) just write
 /// `const NUM_QUERIES: usize = deep_ali::stark_level::NUM_QUERIES_LEVEL;`
 /// and the right value flows through from the workspace Cargo.toml's
 /// `deep_ali = { features = [...] }` line.
 pub mod stark_level {
-    /// Per-query soundness bits at ρ_0 = 1/32, Johnson regime
-    /// (unconditional, both FRI under BCIKS and STIR Theorem 1).
-    pub const PER_QUERY_BITS_JOHNSON: f64 = 2.5;
+    /// Per-query soundness bits at ρ_0 = 1/32, Johnson regime,
+    /// η-included (slack) yield −log₂(√ρ_0 + η_0) with η_0 ≤ √ρ_0/20
+    /// (unconditional, both FRI under BCIKS and STIR Theorem 1; the
+    /// ideal η=0 bound ½·log₂(1/ρ_0) = 2.5 is the ESORICS figure).
+    pub const PER_QUERY_BITS_JOHNSON: f64 = 2.43;
 
     #[cfg(feature = "sha3-256")]
-    pub const NUM_QUERIES_LEVEL: usize = 54;
+    pub const NUM_QUERIES_LEVEL: usize = 55;
     #[cfg(feature = "sha3-384")]
-    pub const NUM_QUERIES_LEVEL: usize = 79;
+    pub const NUM_QUERIES_LEVEL: usize = 81;
     #[cfg(feature = "sha3-512")]
-    pub const NUM_QUERIES_LEVEL: usize = 105;
+    pub const NUM_QUERIES_LEVEL: usize = 108;
 
     #[cfg(feature = "sha3-256")]
     pub const NIST_LEVEL: u8 = 1;
@@ -61,36 +70,42 @@ pub mod stark_level {
     #[cfg(feature = "sha3-512")]
     pub const TARGET_IT_BITS: usize = 256;
 
-    /// Compute the minimum FRI query count `r` to reach the active
-    /// NIST PQ Level's IT-soundness at a given `blowup` (LDE rate
-    /// denominator).  Uses the unconditional Johnson formula
-    /// `bits/query = ½·log₂(blowup)` (BCIKS / STIR Thm. 1).
+    /// Compute the minimum FRI/STIR query count `r` to reach the
+    /// active NIST PQ Level's IT-soundness at a given `blowup` (LDE
+    /// rate denominator).  Uses the η-included (slack) Johnson yield
+    /// `bits/query = −log₂(√ρ_0 + η_0)` with ρ_0 = 1/blowup and
+    /// η_0 ≤ √ρ_0/20 (5% slack) — 2.43 b/q at blowup=32 (BCIKS / STIR
+    /// Thm. 1, unconditional), versus the ideal η=0 bound 2.5 b/q.
     ///
-    /// Returns `r = ⌈TARGET_IT_BITS / (½·log₂(blowup))⌉` with a
-    /// small constant safety margin of +2 (mirrors `NUM_QUERIES_LEVEL`'s
-    /// +7-ish margin at blowup=32).
+    /// Returns the contraction-theorem floor
+    /// `r = ⌈(λ + log₂(M+2) + 1) / bits_per_q⌉` (M = 8 STIR rounds),
+    /// so κ_sys lands exactly at the NIST floor — no surplus margin.
     ///
-    /// Examples (sha3-256, TARGET_IT_BITS=128):
-    ///   blowup= 4 → r = 130 (½·log₂(4) = 1.0 b/q, ⌈128/1.0⌉ + 2)
-    ///   blowup= 8 → r =  88 (1.5 b/q, ⌈128/1.5⌉ + 2)
-    ///   blowup=16 → r =  66 (2.0 b/q, ⌈128/2.0⌉ + 2)
-    ///   blowup=32 → r =  54 (2.5 b/q, ⌈128/2.5⌉ + 2, matches NUM_QUERIES_LEVEL)
-    ///   blowup=64 → r =  45 (3.0 b/q)
+    /// Examples (sha3-256, λ = TARGET_IT_BITS = 128, M = 8):
+    ///   blowup= 4 → r ≈ 109 (√¼·1.05 → 1.32 b/q)
+    ///   blowup= 8 → r ≈  86 (1.67 b/q)
+    ///   blowup=16 → r ≈  68 (2.05 b/q)
+    ///   blowup=32 → r =  55 (2.43 b/q, matches NUM_QUERIES_LEVEL)
+    ///   blowup=64 → r ≈  46 (2.83 b/q)
     ///
     /// Used by `v2_fri_params` so the v2 sub-AIRs stay at L1 even when
     /// callers pass a non-32 inner blowup (smoke iteration / scaling
-    /// studies).  Returns a value that, multiplied by ½·log₂(blowup),
+    /// studies).  Returns a value that, multiplied by the slack yield,
     /// is at least `TARGET_IT_BITS`.
     pub fn num_queries_for_blowup(blowup: usize) -> usize {
         // Guard against blowup ≤ 1 — Johnson rate is 0 there.
         if blowup < 2 {
             return usize::MAX; // unreachable in practice; fail loud
         }
-        let bits_per_q = 0.5_f64 * (blowup as f64).log2();
-        // Minimum r to clear TARGET_IT_BITS, plus a small margin so a
-        // single rounding error doesn't drop below the threshold.
-        let r_min = (TARGET_IT_BITS as f64 / bits_per_q).ceil() as usize;
-        r_min + 2
+        // η-included (slack) Johnson yield: −log₂(√ρ_0 + η_0),
+        // ρ_0 = 1/blowup, η_0 ≤ √ρ_0/20 ⇒ √ρ_0·1.05.
+        let sqrt_rho = (1.0_f64 / blowup as f64).sqrt();
+        let bits_per_q = -(sqrt_rho * 1.05_f64).log2();
+        // Contraction-theorem floor numerator (λ + log₂(M+2) + 1),
+        // M = 8 STIR rounds; no extra margin — κ_sys sits at the floor.
+        const M_REF: f64 = 8.0;
+        let numerator = TARGET_IT_BITS as f64 + (M_REF + 2.0).log2() + 1.0;
+        (numerator / bits_per_q).ceil() as usize
     }
 
     /// Target collision-resistance bits (matches `min(n_out, c)` of

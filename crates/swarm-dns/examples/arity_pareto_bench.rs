@@ -1,7 +1,7 @@
 //! Per-layer folding-arity Pareto sweep for the STIR paper.
 //!
 //! Proves the Fibonacci AIR at the paper's headline config
-//! (`T=2^16`, `rho_0=1/32` so `|H_0|=2^21`, L1, `Fp6`, SHA3-256, `r=54`)
+//! (`T=2^16`, `rho_0=1/32` so `|H_0|=2^21`, L1, `Fp6`, SHA3-256, `r=55`)
 //! under a single folding schedule chosen by the `SCHED` env var, and
 //! prints proof size + prove time.  Run once per schedule (a driver runs
 //! it under `/usr/bin/time -l` to capture peak RSS) to map the
