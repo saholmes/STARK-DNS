@@ -624,3 +624,141 @@ pub fn verify_one_sub_air_with_trace(
 
     Ok(())
 }
+
+/// Witness-binding prover for AIRs with **only local (per-row) constraints**
+/// --- whose constraint evaluator is a function of `cur` and the row index
+/// but does NOT read the next row `nxt`.  Identical to
+/// [`prove_one_sub_air_with_trace`] except it omits the next-row trace
+/// openings, halving the opening payload (and the binding memory) for very
+/// wide local AIRs such as the single-row ECDSA-P256 verifier.
+///
+/// SOUNDNESS: the verifier's per-query check is
+/// `c_eval(x)·Z_H(x) = Σ_j α_j Φ_j(cur(x))`; for a local AIR `Φ_j` does not
+/// depend on `nxt`, so the next-row openings carry no soundness and dropping
+/// them loses nothing.  The companion [`verify_one_sub_air_with_trace_local`]
+/// takes a `(cur, row)` evaluator with **no `nxt` parameter**, so this
+/// optimisation cannot be mis-applied to a transition AIR.
+pub fn prove_one_sub_air_with_trace_local(
+    trace: &[Vec<F>],
+    n_trace: usize,
+    blowup: usize,
+    pi_hash: [u8; 32],
+    domain_sep: &[u8],
+    num_constraints: usize,
+    c_eval_fn: impl FnOnce(&[Vec<F>], usize, usize, &[F]) -> Vec<F>,
+    fri_params_fn: impl FnOnce(usize, [u8; 32]) -> crate::fri::DeepFriParams,
+) -> SubAirProofWithTrace {
+    let n0 = n_trace * blowup;
+    let lde = crate::trace_import::lde_trace_columns(trace, n_trace, blowup)
+        .expect("LDE construction");
+    let (trace_root, tree) = commit_trace_lde(&lde, domain_sep);
+    let aug_pi_hash = augment_pi_hash(&pi_hash, &trace_root, domain_sep);
+    let comb_coeffs = comb_coeffs_aug(num_constraints, &aug_pi_hash, domain_sep);
+    let c_eval = c_eval_fn(&lde, n_trace, blowup, &comb_coeffs);
+    let domain = FriDomain::new_radix2(n0);
+    let params = fri_params_fn(n0, aug_pi_hash);
+    let fri_proof = deep_fri_prove::<Ext>(c_eval, domain, &params);
+
+    let positions = extract_query_positions(&fri_proof)
+        .expect("FRI/STIR proof has at least one query position");
+    let width = lde.len();
+    let mut openings_cur = Vec::with_capacity(positions.len());
+    for &pos in &positions {
+        let cur_cells: Vec<F> = (0..width).map(|c| lde[c][pos]).collect();
+        openings_cur.push(TraceOpening { cells: cur_cells, merkle: tree.open(pos) });
+    }
+
+    SubAirProofWithTrace {
+        fri_proof_bytes: serialize_fri(&fri_proof),
+        trace_root,
+        openings_cur,
+        openings_nxt: Vec::new(), // local AIR: no next-row openings needed
+    }
+}
+
+/// Verifier for [`prove_one_sub_air_with_trace_local`].  The evaluator
+/// signature `(cur, trace_row) -> Vec<F>` has no `nxt` parameter, so the
+/// omission of next-row openings is sound by construction.
+pub fn verify_one_sub_air_with_trace_local(
+    proof: &SubAirProofWithTrace,
+    n_trace: usize,
+    blowup: usize,
+    pi_hash: [u8; 32],
+    domain_sep: &[u8],
+    width: usize,
+    num_constraints: usize,
+    eval_local_fn: impl Fn(&[F], usize) -> Vec<F>,
+    fri_params_fn: impl Fn(usize, [u8; 32]) -> crate::fri::DeepFriParams,
+) -> Result<(), String> {
+    let n0 = n_trace * blowup;
+    let aug_pi_hash = augment_pi_hash(&pi_hash, &proof.trace_root, domain_sep);
+
+    let fri_proof = deserialize_fri(&proof.fri_proof_bytes)?;
+    let params = fri_params_fn(n0, aug_pi_hash);
+    if !deep_fri_verify::<Ext>(&params, &fri_proof) {
+        return Err("FRI verify rejected".into());
+    }
+    let positions = extract_query_positions(&fri_proof)?;
+    let n_queries = positions.len();
+    let m0 = params.schedule.first().copied().unwrap_or(2);
+
+    let comb_coeffs = comb_coeffs_aug(num_constraints, &aug_pi_hash, domain_sep);
+    if comb_coeffs.len() != num_constraints {
+        return Err(format!(
+            "comb_coeffs length {} ≠ num_constraints {num_constraints}",
+            comb_coeffs.len()
+        ));
+    }
+    if proof.openings_cur.len() != n_queries {
+        return Err(format!(
+            "cur openings count {} ≠ {n_queries}", proof.openings_cur.len()
+        ));
+    }
+    if !proof.openings_nxt.is_empty() {
+        return Err("local verifier expects no next-row openings".into());
+    }
+
+    let cfg = trace_tree_cfg(n0);
+    let tag = trace_tree_tag(n0, width, domain_sep);
+
+    for k in 0..n_queries {
+        let (pos, c_eval_at_pos) = extract_query_position_and_c_eval(&fri_proof, k, n0, m0)?;
+        let cur_op = &proof.openings_cur[k];
+        if cur_op.cells.len() != width {
+            return Err(format!("query {k}: cur cells len {} ≠ {width}", cur_op.cells.len()));
+        }
+        if cur_op.merkle.index != pos {
+            return Err(format!("query {k}: cur Merkle index {} ≠ {pos}", cur_op.merkle.index));
+        }
+        let cur_leaf = compute_leaf_hash(&cfg, pos, &cur_op.cells);
+        if cur_leaf != cur_op.merkle.leaf {
+            return Err(format!("query {k}: cur cells hash ≠ committed leaf"));
+        }
+        if !MerkleTreeChannel::verify_opening(&cfg, proof.trace_root, &cur_op.merkle, &tag) {
+            return Err(format!("query {k}: cur trace Merkle path failed"));
+        }
+
+        let trace_row = pos / blowup;
+        if trace_row >= n_trace - 1 {
+            continue;
+        }
+        let cvals = eval_local_fn(&cur_op.cells, trace_row);
+        if cvals.len() != num_constraints {
+            return Err(format!(
+                "query {k}: eval_local returned {} ≠ {num_constraints}", cvals.len()
+            ));
+        }
+        let phi_at_pos: F = (0..num_constraints).map(|j| comb_coeffs[j] * cvals[j]).sum();
+        let pos_f = lde_omega_pow(pos, n0);
+        let z_h = z_h_at(pos_f, n_trace);
+        let lhs = c_eval_at_pos * Ext::from_fp(z_h);
+        let rhs = Ext::from_fp(phi_at_pos);
+        if lhs != rhs {
+            return Err(format!(
+                "query {k} (pos={pos}, row={trace_row}): constraint formula mismatch"
+            ));
+        }
+    }
+
+    Ok(())
+}

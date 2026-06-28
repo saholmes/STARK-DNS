@@ -37,7 +37,9 @@ use deep_ali::{
     p256_field::NUM_LIMBS as P256_NUM_LIMBS,
     p256_group::GENERATOR as P256_GENERATOR,
     p256_scalar::ScalarElement,
-    sub_air_with_trace::{prove_one_sub_air_with_trace, verify_one_sub_air_with_trace},
+    sub_air_with_trace::{
+        prove_one_sub_air_with_trace_local, verify_one_sub_air_with_trace_local,
+    },
 };
 
 const BLOWUP: usize = 32;
@@ -119,17 +121,21 @@ fn main() {
     };
 
     let prove_verify = |trace: &[Vec<F>]| -> (f64, f64, usize, bool) {
+        // ECDSA v2 constraints are LOCAL (cur-only) -> use the local
+        // witness-binding path that omits the next-row openings (half the
+        // payload).  Sound: the verifier check c_eval*Z_H = Sum a_j Phi_j(cur)
+        // never reads nxt for a local AIR.
         let t0 = Instant::now();
-        let proof = prove_one_sub_air_with_trace(
+        let proof = prove_one_sub_air_with_trace_local(
             trace, n_trace, BLOWUP, PI_HASH, b"ecdsa_v2_bound", kk,
             |lde, nt, bw, cc| deep_ali_merge_p256_ecdsa_v2_rowgated_streaming(lde, cc, &layout, nt, bw).0,
             |n0, ph| mk_params(n0, r, use_stir, ph),
         );
         let prove_ms = t0.elapsed().as_secs_f64() * 1000.0;
         let t0 = Instant::now();
-        let ok = verify_one_sub_air_with_trace(
+        let ok = verify_one_sub_air_with_trace_local(
             &proof, n_trace, BLOWUP, PI_HASH, b"ecdsa_v2_bound", total, kk,
-            |cur, _nxt, row| eval_ecdsa_verify_v2_rowgated_per_row(cur, row, &layout),
+            |cur, row| eval_ecdsa_verify_v2_rowgated_per_row(cur, row, &layout),
             |n0, ph| mk_params(n0, r, use_stir, ph),
         ).is_ok();
         (prove_ms, t0.elapsed().as_secs_f64() * 1000.0, proof.fri_proof_bytes.len(), ok)
