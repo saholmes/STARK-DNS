@@ -1840,6 +1840,66 @@ pub fn deep_ali_merge_p256_ecdsa_v2_streaming(
     (c_eval, info)
 }
 
+/// Witness-binding-compatible merge for the single-row ECDSA-P256 v2 AIR.
+/// Gates the row-0 boundary by a `trace_row == 0` step (via
+/// [`crate::p256_ecdsa_air_v2::eval_ecdsa_verify_v2_rowgated_per_row`])
+/// instead of the Lagrange `row0_indicator` of
+/// [`deep_ali_merge_p256_ecdsa_v2_streaming`], so the prover's `c_eval`
+/// and the generic `sub_air_with_trace` verifier (which re-checks the
+/// same per-row evaluator at query openings) agree.  Enables an
+/// end-to-end witness-binding ECDSA verifier.
+pub fn deep_ali_merge_p256_ecdsa_v2_rowgated_streaming(
+    trace_evals_on_lde: &[Vec<F>],
+    combination_coeffs: &[F],
+    layout: &crate::p256_ecdsa_air_v2::EcdsaVerifyV2Layout,
+    n_trace: usize,
+    blowup: usize,
+) -> (Vec<F>, CompositionInfo) {
+    use crate::p256_ecdsa_air_v2::{
+        ecdsa_verify_v2_constraints, eval_ecdsa_verify_v2_rowgated_per_row,
+    };
+    let n = n_trace * blowup;
+    let w = trace_evals_on_lde.len();
+    let k = ecdsa_verify_v2_constraints(layout);
+    assert_eq!(combination_coeffs.len(), k);
+    for col in trace_evals_on_lde {
+        assert_eq!(col.len(), n);
+    }
+
+    let eval_at = |i: usize| -> F {
+        let cur: Vec<F> = (0..w).map(|c| trace_evals_on_lde[c][i]).collect();
+        let cvals = eval_ecdsa_verify_v2_rowgated_per_row(&cur, i / blowup, layout);
+        let mut acc = F::zero();
+        for j in 0..k { acc += combination_coeffs[j] * cvals[j]; }
+        acc
+    };
+    let phi_eval: Vec<F> = if enable_parallel(n) {
+        #[cfg(feature = "parallel")]
+        { (0..n).into_par_iter().map(eval_at).collect() }
+        #[cfg(not(feature = "parallel"))]
+        { (0..n).map(eval_at).collect() }
+    } else {
+        (0..n).map(eval_at).collect()
+    };
+
+    let domain = GeneralEvaluationDomain::<F>::new(n).expect("power-of-two domain");
+    let phi_coeffs = domain.ifft(&phi_eval);
+    let c_coeffs = poly_div_zh(&phi_coeffs, n_trace);
+    let mut padded = c_coeffs.clone();
+    padded.resize(n, F::zero());
+    let c_eval = domain.fft(&padded);
+
+    let max_deg = 3usize;
+    let phi_degree_bound = max_deg * n_trace;
+    let quotient_degree_bound = if phi_degree_bound > n_trace { phi_degree_bound - n_trace } else { 0 };
+    let info = CompositionInfo {
+        phi_degree_bound, quotient_degree_bound,
+        rate: quotient_degree_bound as f64 / n as f64,
+        num_constraints: k, max_constraint_degree: max_deg, trace_width: w,
+    };
+    (c_eval, info)
+}
+
 // ═══════════════════════════════════════════════════════════════════
 //  Legacy single-constraint merge (Fibonacci: Φ̃ = a·s + e − t)
 // ═══════════════════════════════════════════════════════════════════
