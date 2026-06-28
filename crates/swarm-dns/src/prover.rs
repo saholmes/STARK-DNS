@@ -11,10 +11,13 @@ use deep_ali::{
     air_workloads::{
         build_execution_trace, build_hash_rollup_trace, build_nsec3_chain_trace,
         build_nsec3_nodata_trace, build_nsec3_optout_trace, build_lex_lt_trace,
-        nsec3_type_present,
+        evaluate_constraints, nsec3_type_present,
         ed25519_zsk_ksk_default_layout, pack_hash_to_leaves, AirType,
     },
     binding_cells_commit::Ext as DaExt,
+    sub_air_with_trace::{
+        prove_one_sub_air_with_trace, verify_one_sub_air_with_trace, SubAirProofWithTrace,
+    },
     deep_ali_merge_ed25519_verify, deep_ali_merge_general, deep_ali_merge_sha256,
     ed25519_verify_air::{
         fill_verify_air_v16, r_thread_bits_for_kA, verify_air_layout_v16,
@@ -490,6 +493,103 @@ pub fn prove_nsec3_completeness(
         root_f0: proof.root_f0,
         proof_blob,
     }
+}
+
+/// Witness-binding NSEC3 completeness proof.  Unlike [`Nsec3Output`]
+/// (a bare `deep_fri_prove(c_eval)` proof — sound only for
+/// low-degreeness, so a constraint-violating chain still verifies),
+/// this routes the `Nsec3Chain` AIR through
+/// [`prove_one_sub_air_with_trace`]: the trace LDE is Merkle-committed
+/// (its root folded into the FS public-input hash) and the verifier
+/// re-checks `c_eval(x)·Z_H(x) = Σ α_j Φ_j(trace[x])` at every
+/// authenticated FRI query opening.  A tampered chain (a gap, an
+/// unsorted/broken link) is therefore rejected *in-circuit*.
+pub struct Nsec3BoundProof {
+    pub chain_root:   [u8; 32],
+    pub record_count: usize,
+    pub n_trace:      usize,
+    pub prove_ms:     f64,
+    pub proof:        SubAirProofWithTrace,
+}
+
+fn nsec3_chain_root(records: &[Nsec3Record], salt: &[u8; 16]) -> [u8; 32] {
+    let mut h = sha3::Sha3_256::new();
+    Digest::update(&mut h, b"DNS-NSEC3-CHAIN-ROOT-V1");
+    Digest::update(&mut h, salt);
+    Digest::update(&mut h, &(records.len() as u64).to_le_bytes());
+    for r in records {
+        Digest::update(&mut h, &r.owner_hash);
+        Digest::update(&mut h, &r.next_hash);
+    }
+    Digest::finalize(h).into()
+}
+
+fn nsec3_bound_pi_hash(salt: &[u8; 16], count: usize, chain_root: &[u8; 32], fs_binding_32: &[u8; 32]) -> [u8; 32] {
+    let mut h = sha3::Sha3_256::new();
+    Digest::update(&mut h, b"DNS-NSEC3-BOUND-PIHASH-V1");
+    Digest::update(&mut h, salt);
+    Digest::update(&mut h, &(count as u64).to_le_bytes());
+    Digest::update(&mut h, chain_root);
+    Digest::update(&mut h, fs_binding_32);
+    Digest::finalize(h).into()
+}
+
+fn nsec3_bound_params(n0: usize, ldt: LdtMode, ph: [u8; 32]) -> DeepFriParams {
+    DeepFriParams {
+        schedule: make_schedule(n0, ldt), r: NUM_QUERIES, seed_z: SEED_Z,
+        coeff_commit_final: true, d_final: 1, stir: ldt.is_stir(), s0: NUM_QUERIES,
+        public_inputs_hash: Some(ph),
+    }
+}
+
+/// Witness-binding variant of [`prove_nsec3_completeness`].
+pub fn prove_nsec3_completeness_bound(
+    records: &[Nsec3Record],
+    salt: &[u8; 16],
+    fs_binding_32: &[u8; 32],
+    ldt: LdtMode,
+) -> Nsec3BoundProof {
+    assert!(!records.is_empty(), "NSEC3 chain must be non-empty");
+    let chain: Vec<([u64; 4], [u64; 4])> = records.iter().map(|r| {
+        (pack_hash_to_leaves(&r.owner_hash), pack_hash_to_leaves(&r.next_hash))
+    }).collect();
+    let n_trace = next_pow2(records.len());
+    let last = records.last().unwrap();
+    let first = records.first().unwrap();
+    assert_eq!(last.next_hash, first.owner_hash, "NSEC3 chain must be closed");
+
+    let chain_root = nsec3_chain_root(records, salt);
+    let trace = build_nsec3_chain_trace(n_trace, &chain);
+    let air = AirType::Nsec3Chain;
+    let pi_hash = nsec3_bound_pi_hash(salt, records.len(), &chain_root, fs_binding_32);
+
+    let t0 = Instant::now();
+    let proof = prove_one_sub_air_with_trace(
+        &trace, n_trace, BLOWUP, pi_hash, b"nsec3_completeness_bound", air.num_constraints(),
+        |lde, nt, bw, cc| deep_ali_merge_general(lde, cc, air, F::from(0u64), nt, bw).0,
+        |n0, ph| nsec3_bound_params(n0, ldt, ph),
+    );
+    let prove_ms = t0.elapsed().as_secs_f64() * 1e3;
+    Nsec3BoundProof { chain_root, record_count: records.len(), n_trace, prove_ms, proof }
+}
+
+/// Verify a witness-binding NSEC3 completeness proof.  Returns `true`
+/// only if the committed trace genuinely satisfies the `Nsec3Chain`
+/// constraints (checked at the authenticated query openings).
+pub fn verify_nsec3_completeness_bound(
+    bp: &Nsec3BoundProof,
+    salt: &[u8; 16],
+    fs_binding_32: &[u8; 32],
+    ldt: LdtMode,
+) -> bool {
+    let air = AirType::Nsec3Chain;
+    let pi_hash = nsec3_bound_pi_hash(salt, bp.record_count, &bp.chain_root, fs_binding_32);
+    verify_one_sub_air_with_trace(
+        &bp.proof, bp.n_trace, BLOWUP, pi_hash, b"nsec3_completeness_bound",
+        air.width(), air.num_constraints(),
+        |cur, nxt, row| evaluate_constraints(air, cur, nxt, row),
+        |n0, ph| nsec3_bound_params(n0, ldt, ph),
+    ).is_ok()
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
