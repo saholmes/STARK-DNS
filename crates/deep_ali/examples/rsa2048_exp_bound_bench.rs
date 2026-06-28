@@ -56,11 +56,11 @@ fn mk_params(n0: usize, r: usize, use_stir: bool, ph: [u8; 32]) -> DeepFriParams
 const PI_HASH: [u8; 32] = [0x11; 32]; // domain constant; trace_root binds the witness
 
 /// Prove the compact exp AIR for (n,s,em) via the witness-binding path,
-/// then verify. Returns (prove_ms, verify_ms, fri_kib, opening_cells, verify_ok).
+/// then verify. Returns (prove_ms, verify_ms, fri_kib, full_mib, opening_cells, verify_ok).
 fn prove_then_verify(
     layout: &RsaExpMultirowLayout, width: usize, n: &BigUint, s: &BigUint, em: &BigUint,
     n_trace: usize, blowup: usize, r: usize, use_stir: bool,
-) -> (f64, f64, f64, usize, bool) {
+) -> (f64, f64, f64, f64, usize, bool) {
     let kk = rsa_exp_multirow_constraints(layout);
     let mut trace: Vec<Vec<F>> = (0..width).map(|_| vec![F::zero(); n_trace]).collect();
     fill_rsa_exp_multirow(&mut trace, layout, n_trace, n, s, em);
@@ -82,9 +82,12 @@ fn prove_then_verify(
     let verify_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
     let fri_kib = proof.fri_proof_bytes.len() as f64 / 1024.0;
+    // COMPLETE sound proof = full serialized SubAirProofWithTrace (LDT + openings + paths).
+    let full_mib =
+        deep_ali::sub_air_with_trace::serialize_proof(&proof).len() as f64 / 1048576.0;
     let opening_cells: usize = proof.openings_cur.iter().map(|o| o.cells.len()).sum::<usize>()
         + proof.openings_nxt.iter().map(|o| o.cells.len()).sum::<usize>();
-    (prove_ms, verify_ms, fri_kib, opening_cells, res.is_ok())
+    (prove_ms, verify_ms, fri_kib, full_mib, opening_cells, res.is_ok())
 }
 
 fn main() {
@@ -107,19 +110,19 @@ fn main() {
     let bogus_em = (&em + BigUint::from(1u8)) % &n;
 
     // ── Honest: must ACCEPT ──
-    let (p_ms, v_ms, fri_kib, op_cells, ok) =
+    let (p_ms, v_ms, fri_kib, full_mib, op_cells, ok) =
         prove_then_verify(&layout, width, &n, &s, &em, n_trace, blowup, r, use_stir);
     eprintln!("[honest]   prove {p_ms:.1} ms, verify {v_ms:.2} ms, fri {fri_kib:.1} KiB, \
-               binding openings {op_cells} cells -> verify={ok}");
+               FULL sound proof {full_mib:.2} MiB ({op_cells} opening cells) -> verify={ok}");
     assert!(ok, "BINDING BROKEN: honest record must verify");
 
     // ── Tampered: must REJECT (this is the whole point) ──
-    let (_, _, _, _, bad_ok) =
+    let (_, _, _, _, _, bad_ok) =
         prove_then_verify(&layout, width, &n, &s, &bogus_em, n_trace, blowup, r, use_stir);
     eprintln!("[tampered] em=s^65537+1 -> verify={bad_ok}");
 
     println!("rsa2048_exp_bound level=L{level} field=Fp{ext_deg} n_trace={n_trace} blowup={blowup} \
-              r={r} prove_ms={p_ms:.1} verify_ms={v_ms:.2} fri_kib={fri_kib:.1} \
+              r={r} prove_ms={p_ms:.1} verify_ms={v_ms:.2} fri_kib={fri_kib:.1} proof_mib={full_mib:.2} \
               honest_verify={ok} tampered_verify={bad_ok}");
     if !bad_ok {
         println!("=> WITNESS-BINDING WORKS: honest accepts, tampered REJECTS (sound in-circuit RSA)");

@@ -214,10 +214,12 @@ fn main() {
     let proof_a = prove(&trace_a, &case_a, &layout);
     let prove_ms = t.elapsed().as_secs_f64() * 1000.0;
     let fri_b = proof_a.fri_proof_bytes.len();
+    // COMPLETE sound proof = full serialized SubAirProofWithTrace (LDT + openings + paths).
+    let full_mib = deep_ali::sub_air_with_trace::serialize_proof(&proof_a).len() as f64 / 1048576.0;
     let t = Instant::now();
     let honest_a = verify(&proof_a, &case_a, &layout);
     let verify_ms = t.elapsed().as_secs_f64() * 1000.0;
-    eprintln!("[honest A]  prove {prove_ms:.1} ms, verify {verify_ms:.2} ms, fri {} KiB -> verify={honest_a}", fri_b / 1024);
+    eprintln!("[honest A]  prove {prove_ms:.1} ms, verify {verify_ms:.2} ms, fri {} KiB, FULL sound proof {full_mib:.2} MiB -> verify={honest_a}", fri_b / 1024);
     assert!(honest_a, "BINDING BROKEN: honest A must accept under A's public inputs");
 
     // ── CROSS: A's proof, verified under B's pi_hash + B's pins → REJECT. ──
@@ -240,7 +242,7 @@ fn main() {
 
     println!(
         "ecdsa_verify_multirow_pub K={k} n_trace={n_trace} per_row_width={total} r={r} blowup={blowup} \
-         prove_ms={prove_ms:.1} verify_ms={verify_ms:.2} fri_kib={} native={} \
+         prove_ms={prove_ms:.1} verify_ms={verify_ms:.2} fri_kib={} proof_mib={full_mib:.2} native={} \
          honest_A={honest_a} honest_B={honest_b} cross_A_under_B={cross_a_under_b} \
          cross_B_under_A={cross_b_under_a} internal_tamper={internal_tamper}",
         fri_b / 1024, case_a.native_ok
