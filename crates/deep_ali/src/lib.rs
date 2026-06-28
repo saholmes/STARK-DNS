@@ -1900,6 +1900,68 @@ pub fn deep_ali_merge_p256_ecdsa_v2_rowgated_streaming(
     (c_eval, info)
 }
 
+/// Composition merge for the **narrow multi-row** P256 ECDSA double-scalar-mult
+/// AIR (`p256_ecdsa_double_multirow_air`): one scalar-mult step per row, ~256
+/// narrow rows, accumulator threaded row-to-row by transition constraints
+/// (the StarkWare-style layout).  This is the width-efficient, bindable form:
+/// per-row width is one step (not the entire unrolled chain), so
+/// `sub_air_with_trace` openings (`r × per-row-width`) stay small.  The
+/// evaluator reads `cur` AND `nxt` (transition), so the FULL binding (with
+/// next-row openings) is required.
+pub fn deep_ali_merge_ecdsa_double_multirow_streaming(
+    trace_evals_on_lde: &[Vec<F>],
+    combination_coeffs: &[F],
+    layout: &crate::p256_ecdsa_double_multirow_air::EcdsaDoubleMultirowLayout,
+    n_trace: usize,
+    blowup: usize,
+) -> (Vec<F>, CompositionInfo) {
+    use crate::p256_ecdsa_double_multirow_air::{
+        ecdsa_double_multirow_constraints, eval_ecdsa_double_multirow_per_row,
+    };
+    let n = n_trace * blowup;
+    let w = trace_evals_on_lde.len();
+    let k = ecdsa_double_multirow_constraints(layout);
+    assert_eq!(combination_coeffs.len(), k);
+    for col in trace_evals_on_lde {
+        assert_eq!(col.len(), n);
+    }
+
+    let eval_at = |i: usize| -> F {
+        let cur: Vec<F> = (0..w).map(|c| trace_evals_on_lde[c][i]).collect();
+        let nxt_idx = (i + blowup) % n;
+        let nxt: Vec<F> = (0..w).map(|c| trace_evals_on_lde[c][nxt_idx]).collect();
+        let cvals = eval_ecdsa_double_multirow_per_row(&cur, &nxt, i / blowup, n_trace, layout);
+        let mut acc = F::zero();
+        for j in 0..k { acc += combination_coeffs[j] * cvals[j]; }
+        acc
+    };
+    let phi_eval: Vec<F> = if enable_parallel(n) {
+        #[cfg(feature = "parallel")]
+        { (0..n).into_par_iter().map(eval_at).collect() }
+        #[cfg(not(feature = "parallel"))]
+        { (0..n).map(eval_at).collect() }
+    } else {
+        (0..n).map(eval_at).collect()
+    };
+
+    let domain = GeneralEvaluationDomain::<F>::new(n).expect("power-of-two domain");
+    let phi_coeffs = domain.ifft(&phi_eval);
+    let c_coeffs = poly_div_zh(&phi_coeffs, n_trace);
+    let mut padded = c_coeffs.clone();
+    padded.resize(n, F::zero());
+    let c_eval = domain.fft(&padded);
+
+    let max_deg = 3usize;
+    let phi_degree_bound = max_deg * n_trace;
+    let quotient_degree_bound = if phi_degree_bound > n_trace { phi_degree_bound - n_trace } else { 0 };
+    let info = CompositionInfo {
+        phi_degree_bound, quotient_degree_bound,
+        rate: quotient_degree_bound as f64 / n as f64,
+        num_constraints: k, max_constraint_degree: max_deg, trace_width: w,
+    };
+    (c_eval, info)
+}
+
 // ═══════════════════════════════════════════════════════════════════
 //  Legacy single-constraint merge (Fibonacci: Φ̃ = a·s + e − t)
 // ═══════════════════════════════════════════════════════════════════
