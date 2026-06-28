@@ -20,8 +20,8 @@ use deep_ali::{
     },
     deep_ali_merge_ed25519_verify, deep_ali_merge_general, deep_ali_merge_sha256,
     ed25519_verify_air::{
-        fill_verify_air_v16, r_thread_bits_for_kA, verify_air_layout_v16,
-        verify_v16_per_row_constraints,
+        eval_verify_air_v16_per_row, fill_verify_air_v16, r_thread_bits_for_kA,
+        verify_air_layout_v16, verify_v16_per_row_constraints,
     },
     ed25519_scalar::reduce_mod_l_wide,
     fri::{deep_fri_proof_size_bytes, deep_fri_prove, deep_fri_verify, DeepFriParams, FriDomain},
@@ -1897,6 +1897,163 @@ pub fn prove_zsk_ksk_binding_v2(
         prove_ms,
         local_verify_ms,
     }
+}
+
+/// Witness-binding output for the v2 ZSK→KSK Ed25519 verify proof.
+/// Holds the full [`SubAirProofWithTrace`] (LDT + per-query trace
+/// openings + Merkle paths) — the *complete* sound proof.
+pub struct ZskKskBoundOutput {
+    pub pi_hash:  [u8; 32],
+    pub verified: bool,
+    pub n_trace:  usize,
+    pub blowup:   usize,
+    /// FRI query count — MUST be coupled to `blowup` via the slack Johnson
+    /// bound (`r ≈ ⌈λ / (0.5·log₂(blowup) − 0.07)⌉`) to hit the target level.
+    pub r:        usize,
+    pub k_scalar: usize,
+    pub prove_ms: f64,
+    pub proof:    SubAirProofWithTrace,
+}
+
+/// Slack-Johnson FRI query count for a given blowup and target soundness
+/// bits: per-query yield is `−log₂(√ρ + η) = 0.5·log₂(blowup) − 0.07` at
+/// `η = √ρ/20` (matches the hardcoded 2.43 b/q at blowup=32).  Returns the
+/// query count `r` (plus a small +2 margin) needed for `lambda_bits`.
+pub fn slack_johnson_queries(blowup: usize, lambda_bits: usize) -> usize {
+    let bits_per_q = 0.5_f64 * (blowup as f64).log2() - 0.07_f64;
+    debug_assert!(bits_per_q > 0.0, "blowup must exceed 1");
+    ((lambda_bits as f64) / bits_per_q).ceil() as usize + 2
+}
+
+/// Witness-binding variant of [`prove_zsk_ksk_binding_v2`].  That
+/// function emits a bare `deep_fri_prove(c_eval)` proof — sound only for
+/// low-degreeness, so a constraint-violating (tampered) Ed25519 witness
+/// still verifies.  This routes the same v16 verify AIR through
+/// [`prove_one_sub_air_with_trace`]: the trace LDE is Merkle-committed
+/// (its root folded into the FS pi_hash *before* the constraint-composition
+/// challenges are drawn) and the verifier re-checks
+/// `c_eval(x)·Z_H(x) = Σ α_j Φ_j(trace[x])` at every authenticated query
+/// opening — so a tampered signature is rejected *in-circuit*.
+pub fn prove_zsk_ksk_binding_v2_bound(
+    ksk_pubkey:     &[u8; 32],
+    signature:      &[u8; 64],
+    signed_data:    &[u8],
+    fs_binding_32:  &[u8; 32],
+    merkle_root_32: &[u8; 32],
+    k_scalar:       usize,
+    blowup:         usize,
+    r:              usize,
+    ldt:            LdtMode,
+) -> ZskKskBoundOutput {
+    // Native sanity check (a satisfying proof requires this).
+    let native_ok = deep_ali::ed25519_verify::verify(ksk_pubkey, signature, signed_data);
+    assert!(native_ok,
+        "prove_zsk_ksk_binding_v2_bound: native Ed25519 verification failed");
+
+    let r_compressed: [u8; 32] = signature[0..32].try_into().unwrap();
+    let s_bytes:      [u8; 32] = signature[32..64].try_into().unwrap();
+    let mut sha512_input = Vec::with_capacity(64 + signed_data.len());
+    sha512_input.extend_from_slice(&r_compressed);
+    sha512_input.extend_from_slice(ksk_pubkey);
+    sha512_input.extend_from_slice(signed_data);
+    let s_bits = s_bits_for_ladder(&s_bytes, k_scalar);
+    let digest = sha512_air::sha512_native(&sha512_input);
+    let mut digest_arr = [0u8; 64];
+    digest_arr.copy_from_slice(&digest);
+    let k_canonical = reduce_mod_l_wide(&digest_arr);
+    let k_bits = r_thread_bits_for_kA(&k_canonical, k_scalar);
+
+    let layout = verify_air_layout_v16(
+        sha512_input.len(), &s_bits, &k_bits, &r_compressed, ksk_pubkey,
+    ).expect("v16 layout must succeed for a validly-decoded pubkey/sig");
+    let (trace, _layout, _k_can) = fill_verify_air_v16(
+        &sha512_input, &r_compressed, ksk_pubkey, &s_bits, &k_bits,
+    ).expect("v16 trace builder must succeed for valid R / A");
+
+    let n_trace = layout.height.next_power_of_two();
+    let trace: Vec<Vec<F>> = trace.into_iter()
+        .map(|mut col| { col.resize(n_trace, F::from(0u64)); col })
+        .collect();
+    let kk = verify_v16_per_row_constraints(k_scalar);
+    let pi_hash = zsk_ksk_pi_hash_v2_runtime(
+        ksk_pubkey, signature, signed_data, fs_binding_32, merkle_root_32,
+    );
+
+    let mk = |n0: usize, ph: [u8; 32]| DeepFriParams {
+        schedule: make_schedule(n0, ldt), r, seed_z: SEED_Z,
+        coeff_commit_final: true, d_final: 1, stir: ldt.is_stir(), s0: r,
+        public_inputs_hash: Some(ph),
+    };
+
+    let t0 = Instant::now();
+    let proof = prove_one_sub_air_with_trace(
+        &trace, n_trace, blowup, pi_hash, b"zsk_ksk_v2_bound", kk,
+        |lde, nt, bw, cc| deep_ali_merge_ed25519_verify(lde, cc, &layout, F::from(0u64), nt, bw).0,
+        mk,
+    );
+    let prove_ms = t0.elapsed().as_secs_f64() * 1e3;
+
+    ZskKskBoundOutput { pi_hash, verified: true, n_trace, blowup, r, k_scalar, prove_ms, proof }
+}
+
+/// Verify a witness-binding v2 ZSK→KSK proof.  Returns `true` only if the
+/// committed trace genuinely satisfies the v16 Ed25519 verify constraints
+/// (re-checked at the authenticated query openings) AND the reproduced
+/// public-input commitment matches.  The verifier reconstructs the AIR
+/// layout from the public `(R, A, M)` exactly as the prover did.
+pub fn verify_zsk_ksk_binding_v2_bound(
+    out:            &ZskKskBoundOutput,
+    ksk_pubkey:     &[u8; 32],
+    signature:      &[u8; 64],
+    signed_data:    &[u8],
+    fs_binding_32:  &[u8; 32],
+    merkle_root_32: &[u8; 32],
+    ldt:            LdtMode,
+) -> bool {
+    let pi_hash = zsk_ksk_pi_hash_v2_runtime(
+        ksk_pubkey, signature, signed_data, fs_binding_32, merkle_root_32,
+    );
+    if pi_hash != out.pi_hash { return false; }
+
+    let r_compressed: [u8; 32] = match signature[0..32].try_into() { Ok(v) => v, Err(_) => return false };
+    let s_bytes:      [u8; 32] = match signature[32..64].try_into() { Ok(v) => v, Err(_) => return false };
+    let mut sha512_input = Vec::with_capacity(64 + signed_data.len());
+    sha512_input.extend_from_slice(&r_compressed);
+    sha512_input.extend_from_slice(ksk_pubkey);
+    sha512_input.extend_from_slice(signed_data);
+    let s_bits = s_bits_for_ladder(&s_bytes, out.k_scalar);
+    let digest = sha512_air::sha512_native(&sha512_input);
+    let mut digest_arr = [0u8; 64];
+    digest_arr.copy_from_slice(&digest);
+    let k_canonical = reduce_mod_l_wide(&digest_arr);
+    let k_bits = r_thread_bits_for_kA(&k_canonical, out.k_scalar);
+    let layout = match verify_air_layout_v16(
+        sha512_input.len(), &s_bits, &k_bits, &r_compressed, ksk_pubkey,
+    ) { Some(l) => l, None => return false };
+    let kk = verify_v16_per_row_constraints(out.k_scalar);
+
+    let r = out.r;
+    let mk = |n0: usize, ph: [u8; 32]| DeepFriParams {
+        schedule: make_schedule(n0, ldt), r, seed_z: SEED_Z,
+        coeff_commit_final: true, d_final: 1, stir: ldt.is_stir(), s0: r,
+        public_inputs_hash: Some(ph),
+    };
+
+    verify_one_sub_air_with_trace(
+        &out.proof, out.n_trace, out.blowup, pi_hash, b"zsk_ksk_v2_bound",
+        layout.width, kk,
+        // Gate the verdict identically to the merge: at reduced scalar
+        // width the cofactored verdict (result_row) cannot hold on a
+        // truncated-scalar witness, so it is excluded (no-op at k=256).
+        |cur, nxt, row| {
+            if out.k_scalar < 256 && row == layout.result_row {
+                vec![F::from(0u64); kk]
+            } else {
+                eval_verify_air_v16_per_row(cur, nxt, row, &layout)
+            }
+        },
+        mk,
+    ).is_ok()
 }
 
 // ═══════════════════════════════════════════════════════════════════
