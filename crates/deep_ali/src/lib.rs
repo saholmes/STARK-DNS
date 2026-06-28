@@ -1513,6 +1513,115 @@ pub fn deep_ali_merge_rsa_stacked_streaming(
     (c_eval, info)
 }
 
+/// Composition merge for the **compact** RSA-2048 exp-chain AIR
+/// (`rsa2048_exp_air`, 17 active rows, `n_trace = 32`).  This is the
+/// short-wide layout the paper reports (`n0 = 1024`); the stacked
+/// variant above is the tall-narrow bit-serial layout.  Identical
+/// IFFT -> Z_H -> FFT pipeline to
+/// [`deep_ali_merge_rsa_stacked_streaming`]; only the per-row
+/// constraint evaluator and layout type differ, so soundness carries
+/// (every transition + the row-16 boundary constraint enters `c_eval`).
+pub fn deep_ali_merge_rsa_exp_streaming(
+    trace_evals_on_lde: &[Vec<F>],
+    combination_coeffs: &[F],
+    layout: &crate::rsa2048_exp_air::RsaExpMultirowLayout,
+    omega: F,
+    n_trace: usize,
+    blowup: usize,
+) -> (Vec<F>, CompositionInfo) {
+    use crate::rsa2048_exp_air::{
+        eval_rsa_exp_multirow_per_row, rsa_exp_multirow_constraints,
+    };
+
+    let _ = omega;
+    let n = n_trace * blowup;
+    let w = layout.width;
+    let k = rsa_exp_multirow_constraints(layout);
+
+    assert_eq!(trace_evals_on_lde.len(), w);
+    assert_eq!(combination_coeffs.len(), k);
+    for col in trace_evals_on_lde {
+        assert_eq!(col.len(), n);
+    }
+
+    let build_chunk = |base: usize| -> Vec<Vec<F>> {
+        #[cfg(feature = "parallel")]
+        {
+            (0..blowup)
+                .into_par_iter()
+                .map(|idx| (0..w).map(|c| trace_evals_on_lde[c][base + idx]).collect())
+                .collect()
+        }
+        #[cfg(not(feature = "parallel"))]
+        {
+            (0..blowup)
+                .map(|idx| (0..w).map(|c| trace_evals_on_lde[c][base + idx]).collect())
+                .collect()
+        }
+    };
+
+    let mut phi_eval = vec![F::zero(); n];
+    let mut cur_chunk = build_chunk(0);
+    let chunk0_for_wrap = cur_chunk.clone();
+
+    for r in 0..n_trace {
+        let nxt_chunk: Vec<Vec<F>> = if r + 1 < n_trace {
+            build_chunk((r + 1) * blowup)
+        } else {
+            chunk0_for_wrap.clone()
+        };
+        let base = r * blowup;
+        let trace_row = r;
+        let chunk_phi: Vec<F>;
+        #[cfg(feature = "parallel")]
+        {
+            chunk_phi = (0..blowup)
+                .into_par_iter()
+                .map(|idx| {
+                    let cur: &[F] = &cur_chunk[idx];
+                    let nxt: &[F] = &nxt_chunk[idx];
+                    let cvals = eval_rsa_exp_multirow_per_row(cur, nxt, trace_row, n_trace, layout);
+                    let mut acc = F::zero();
+                    for j in 0..k { acc += combination_coeffs[j] * cvals[j]; }
+                    acc
+                })
+                .collect();
+        }
+        #[cfg(not(feature = "parallel"))]
+        {
+            chunk_phi = (0..blowup)
+                .map(|idx| {
+                    let cur: &[F] = &cur_chunk[idx];
+                    let nxt: &[F] = &nxt_chunk[idx];
+                    let cvals = eval_rsa_exp_multirow_per_row(cur, nxt, trace_row, n_trace, layout);
+                    let mut acc = F::zero();
+                    for j in 0..k { acc += combination_coeffs[j] * cvals[j]; }
+                    acc
+                })
+                .collect();
+        }
+        for (idx, v) in chunk_phi.into_iter().enumerate() { phi_eval[base + idx] = v; }
+        cur_chunk = nxt_chunk;
+    }
+
+    let domain = GeneralEvaluationDomain::<F>::new(n).expect("power-of-two domain");
+    let phi_coeffs = domain.ifft(&phi_eval);
+    let c_coeffs = poly_div_zh(&phi_coeffs, n_trace);
+    let mut padded = c_coeffs.clone();
+    padded.resize(n, F::zero());
+    let c_eval = domain.fft(&padded);
+
+    let max_deg = 2usize;
+    let phi_degree_bound = max_deg * n_trace;
+    let quotient_degree_bound = if phi_degree_bound > n_trace { phi_degree_bound - n_trace } else { 0 };
+    let info = CompositionInfo {
+        phi_degree_bound, quotient_degree_bound,
+        rate: quotient_degree_bound as f64 / n as f64,
+        num_constraints: k, max_constraint_degree: max_deg, trace_width: w,
+    };
+    (c_eval, info)
+}
+
 // ═══════════════════════════════════════════════════════════════════
 //  Streaming P-256 ECDSA verify merge — paper §IV-A Step 2b S_ic path.
 //  Wraps the ported `p256_ecdsa_air::eval_ecdsa_verify_demo` AIR (10 116
