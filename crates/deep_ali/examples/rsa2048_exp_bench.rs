@@ -62,7 +62,7 @@ fn gen_biguint_below(rng: &mut rand::rngs::StdRng, n: &BigUint) -> BigUint {
 
 /// Build the LDE + merge + DeepFriParams for a (possibly tampered) em.
 fn prove_one(n: &BigUint, s: &BigUint, em: &BigUint, blowup: usize, r: usize, use_stir: bool)
-    -> (Vec<F>, DeepFriParams, FriDomain<F>, usize, usize)
+    -> (Vec<F>, DeepFriParams, FriDomain, usize, usize)
 {
     let n_trace = 32usize; // 17 active rows + padding; n0 = 32*32 = 1024
     let (layout, width) = build_rsa_exp_multirow_layout(0);
