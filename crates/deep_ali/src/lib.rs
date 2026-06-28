@@ -1972,6 +1972,7 @@ pub fn deep_ali_merge_ecdsa_verify_multirow_streaming(
     trace_evals_on_lde: &[Vec<F>],
     combination_coeffs: &[F],
     layout: &crate::p256_ecdsa_verify_multirow_air::EcdsaVerifyMultirowLayout,
+    pub_inputs: &crate::p256_ecdsa_verify_multirow_air::EcdsaVerifyPublicInputs,
     n_trace: usize,
     blowup: usize,
 ) -> (Vec<F>, CompositionInfo) {
@@ -1990,7 +1991,7 @@ pub fn deep_ali_merge_ecdsa_verify_multirow_streaming(
         let cur: Vec<F> = (0..w).map(|c| trace_evals_on_lde[c][i]).collect();
         let nxt_idx = (i + blowup) % n;
         let nxt: Vec<F> = (0..w).map(|c| trace_evals_on_lde[c][nxt_idx]).collect();
-        let cvals = eval_ecdsa_verify_multirow_per_row(&cur, &nxt, i / blowup, n_trace, layout);
+        let cvals = eval_ecdsa_verify_multirow_per_row(&cur, &nxt, i / blowup, n_trace, layout, pub_inputs);
         let mut acc = F::zero();
         for j in 0..k { acc += combination_coeffs[j] * cvals[j]; }
         acc

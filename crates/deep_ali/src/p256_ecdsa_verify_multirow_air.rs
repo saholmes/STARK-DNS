@@ -62,6 +62,65 @@ const DSM_BOUNDARY: usize = 6 * NUM_LIMBS; // r_proj boundary at row K-1
 const DSM_ACC_TRANSITION: usize = 2 * 3 * NUM_LIMBS; // acc[r+1]=select[r]
 const DSM_RPROJ_CONSTANCY: usize = 6 * NUM_LIMBS; // r_proj column-constancy
 
+// ── PUBLIC-INPUT BINDING (pin trace public cells to public values) ──
+const PUB_BIT_PINS: usize = 2; // u1-bit, u2-bit (per chain row)
+const PUB_BASE_PINS: usize = 4 * NUM_LIMBS; // Gx, Gy, Qx, Qy (per chain row)
+const PUB_R_PIN: usize = NUM_LIMBS; // signature r at the tail row
+/// Total public-input boundary slots emitted every row.
+pub const PUBLIC_INPUT_PINS: usize = PUB_BIT_PINS + PUB_BASE_PINS + PUB_R_PIN;
+
+/// The ACTUAL public signature data the verifier knows independently of
+/// the prover.  Pinned into the trace's public cells via boundary
+/// constraints (and hashed into `pi_hash` at the bench level), so the
+/// proof binds to *this specific* (signature, key, message), not merely
+/// an internally-consistent witness.
+///
+/// Field-element limbs are stored exactly as the fill places them
+/// (`F::from(limb as u64)` over the tight limbs), so the pins are
+/// bit-exact equalities.
+#[derive(Clone, Debug)]
+pub struct EcdsaVerifyPublicInputs {
+    /// u1 = e·s⁻¹ mod n, MSB-first, as field 0/1 (length K).
+    pub u1_bits: Vec<F>,
+    /// u2 = r·s⁻¹ mod n, MSB-first, as field 0/1 (length K).
+    pub u2_bits: Vec<F>,
+    pub gx: [F; NUM_LIMBS],
+    pub gy: [F; NUM_LIMBS],
+    pub qx: [F; NUM_LIMBS],
+    pub qy: [F; NUM_LIMBS],
+    /// Signature r as a mod-p field element (limbs).
+    pub r: [F; NUM_LIMBS],
+}
+
+impl EcdsaVerifyPublicInputs {
+    pub fn new(
+        u1_bits: &[bool],
+        u2_bits: &[bool],
+        gx: &FieldElement,
+        gy: &FieldElement,
+        qx: &FieldElement,
+        qy: &FieldElement,
+        r: &FieldElement,
+    ) -> Self {
+        let limbs = |fe: &FieldElement| {
+            let mut a = [F::zero(); NUM_LIMBS];
+            for i in 0..NUM_LIMBS {
+                a[i] = F::from(fe.limbs[i] as u64);
+            }
+            a
+        };
+        Self {
+            u1_bits: u1_bits.iter().map(|&b| F::from(b as u64)).collect(),
+            u2_bits: u2_bits.iter().map(|&b| F::from(b as u64)).collect(),
+            gx: limbs(gx),
+            gy: limbs(gy),
+            qx: limbs(qx),
+            qy: limbs(qy),
+            r: limbs(r),
+        }
+    }
+}
+
 /// END-TO-END multi-row ECDSA-verify layout.
 #[derive(Clone, Debug)]
 pub struct EcdsaVerifyMultirowLayout {
@@ -171,6 +230,7 @@ pub fn ecdsa_verify_multirow_constraints(layout: &EcdsaVerifyMultirowLayout) -> 
         + DSM_ACC_TRANSITION
         + DSM_RPROJ_CONSTANCY
         + ecdsa_verify_tail_constraints(layout)
+        + PUBLIC_INPUT_PINS
 }
 
 #[inline]
@@ -308,6 +368,7 @@ pub fn eval_ecdsa_verify_multirow_per_row(
     trace_row: usize,
     _n_trace: usize,
     layout: &EcdsaVerifyMultirowLayout,
+    pub_inputs: &EcdsaVerifyPublicInputs,
 ) -> Vec<F> {
     use crate::p256_scalar_mul_air::eval_scalar_mul_step_gadget;
 
@@ -407,6 +468,37 @@ pub fn eval_ecdsa_verify_multirow_per_row(
         out.resize(base + tail_count, F::zero());
     }
 
+    // (6) PUBLIC-INPUT BINDING: pin trace public cells to the public
+    // values the verifier supplies.  On chain rows: u1/u2 bit cells, the
+    // generator-G base columns (chain A) and the public-key-Q base
+    // columns (chain B).  On the tail row: the signature-r column.
+    let pin_start = out.len();
+    // u1-bit, u2-bit pins (per chain row).
+    if in_chain {
+        out.push(cur[layout.dsm.step_a.bit_cell] - pub_inputs.u1_bits[trace_row]);
+        out.push(cur[layout.dsm.step_b.bit_cell] - pub_inputs.u2_bits[trace_row]);
+    } else {
+        out.push(F::zero());
+        out.push(F::zero());
+    }
+    // Gx, Gy (chain A base) and Qx, Qy (chain B base) pins (per chain row).
+    let push_limb_pin = |out: &mut Vec<F>, fire: bool, base: usize, want: &[F; NUM_LIMBS]| {
+        for i in 0..NUM_LIMBS {
+            if fire {
+                out.push(cur[base + i] - want[i]);
+            } else {
+                out.push(F::zero());
+            }
+        }
+    };
+    push_limb_pin(&mut out, in_chain, layout.dsm.step_a.base_x_base, &pub_inputs.gx);
+    push_limb_pin(&mut out, in_chain, layout.dsm.step_a.base_y_base, &pub_inputs.gy);
+    push_limb_pin(&mut out, in_chain, layout.dsm.step_b.base_x_base, &pub_inputs.qx);
+    push_limb_pin(&mut out, in_chain, layout.dsm.step_b.base_y_base, &pub_inputs.qy);
+    // Signature-r column pin (tail row).
+    push_limb_pin(&mut out, is_tail, layout.r_base, &pub_inputs.r);
+    debug_assert_eq!(out.len() - pin_start, PUBLIC_INPUT_PINS);
+
     debug_assert_eq!(out.len(), total);
     out
 }
@@ -477,12 +569,13 @@ mod tests {
             (&ix, &iy, &iz), (&q.x, &q.y, &zo), &b_bits,
             &r_fe,
         );
+        let pubin = EcdsaVerifyPublicInputs::new(&a_bits, &b_bits, &g.x, &g.y, &q.x, &q.y, &r_fe);
 
         let mut failures = 0usize;
         for r in 0..n_trace {
             let cur: Vec<F> = (0..total).map(|c| trace[c][r]).collect();
             let nxt: Vec<F> = (0..total).map(|c| trace[c][(r + 1) % n_trace]).collect();
-            let cons = eval_ecdsa_verify_multirow_per_row(&cur, &nxt, r, n_trace, &layout);
+            let cons = eval_ecdsa_verify_multirow_per_row(&cur, &nxt, r, n_trace, &layout, &pubin);
             failures += cons.iter().filter(|v| !v.is_zero()).count();
         }
         assert_eq!(failures, 0, "verify-multirow K=4 had {failures} non-zero constraints");
@@ -519,6 +612,7 @@ mod tests {
             (&ix, &iy, &iz), (&q.x, &q.y, &zo), &b_bits,
             &x1,
         );
+        let pubin = EcdsaVerifyPublicInputs::new(&a_bits, &b_bits, &g.x, &g.y, &q.x, &q.y, &x1);
         // Tamper the r public column -> mul_r position identity fires.
         trace[layout.r_base][k] += F::from(1u64);
 
@@ -526,7 +620,7 @@ mod tests {
         for r in 0..n_trace {
             let cur: Vec<F> = (0..total).map(|c| trace[c][r]).collect();
             let nxt: Vec<F> = (0..total).map(|c| trace[c][(r + 1) % n_trace]).collect();
-            let cons = eval_ecdsa_verify_multirow_per_row(&cur, &nxt, r, n_trace, &layout);
+            let cons = eval_ecdsa_verify_multirow_per_row(&cur, &nxt, r, n_trace, &layout, &pubin);
             failures += cons.iter().filter(|v| !v.is_zero()).count();
         }
         assert!(failures >= 1, "tampered r must violate >=1 constraint");
