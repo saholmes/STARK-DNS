@@ -35,7 +35,7 @@ use ark_ff::{Field as _, Zero};
 use ark_goldilocks::Goldilocks;
 use ark_poly::{EvaluationDomain, Radix2EvaluationDomain};
 
-use deep_ali::binding_cells_commit::Ext as DaExt;
+use deep_ali::sextic_ext::SexticExt;
 use deep_ali::fri::{
     DeepFriParams, DeepFriProof, derive_z_ext_for_proof,
     layer_sizes_from_schedule,
@@ -64,14 +64,17 @@ use crate::recursive_prover::{
 };
 use crate::sha3_absorb_air::Sha3Variant;
 
-type Ext = DaExt;
+// The recursion layer is Fp⁶-only at EVERY NIST level: `recursive_prover`
+// hardcodes `type Ext = SexticExt`, so a `RecursiveStarkProof` always carries
+// a `DeepFriProof<SexticExt>`.  The master bridge consumes and re-emits those,
+// so it is likewise Fp⁶ — independent of the outer sha3/level.  (Fp⁶ over
+// Goldilocks is a 384-bit field, leaving ample Schwartz–Zippel margin even at
+// L5.)  Using the level-gated `DaExt` here was a type bug: it became Octic at
+// L5 and could not consume its own Sextic inner proofs.
+type Ext = SexticExt;
 
-/// EXT_DEGREE per build (6 at Fp⁶ / sha3-256/sha3-384, 8 at Fp⁸ / sha3-512).
-#[cfg(any(feature = "sha3-256", feature = "sha3-384"))]
-const EXT_DEGREE: usize = 6;
-#[cfg(feature = "sha3-512")]
-const EXT_DEGREE: usize = 8;
-#[cfg(not(any(feature = "sha3-256", feature = "sha3-384", feature = "sha3-512")))]
+/// EXT_DEGREE = the 6 Goldilocks coordinates of `SexticExt` (the recursion is
+/// Fp⁶ at every level — see the note on `type Ext` above).
 const EXT_DEGREE: usize = 6;
 
 /// Errors from the master recursion bridge.
