@@ -1187,7 +1187,13 @@ pub fn deep_ali_merge_per_row_no_layout(
     blowup: usize,
     width: usize,
     num_constraints: usize,
-    eval_per_row: fn(&[F], &[F], usize) -> Vec<F>,
+    // `impl Fn + Sync` (not a bare `fn` pointer) so callers can pass a
+    // closure that *captures public values* — used by the witness-binding
+    // bound provers to append public-input PIN constraints (cell − public)
+    // to the AIR's own constraints, while sharing the identical eval with the
+    // verifier.  `fn` pointers still coerce, so existing callers are
+    // unaffected.
+    eval_per_row: impl Fn(&[F], &[F], usize) -> Vec<F> + Sync,
 ) -> (Vec<F>, CompositionInfo) {
     let n = n_trace * blowup;
     assert_eq!(trace_evals_on_lde.len(), width);

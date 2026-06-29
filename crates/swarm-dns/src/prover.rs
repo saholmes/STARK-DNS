@@ -1616,6 +1616,32 @@ pub struct LexLtBoundProof {
 }
 
 /// Witness-binding variant of [`prove_lex_lt`].
+/// Public-input PIN count for the LexLt AIR: the 256 a-bits and 256 b-bits
+/// pinned to the public operands, so the proof binds the committed trace to
+/// the PUBLIC `(a,b)` rather than an arbitrary pair the prover chose
+/// (the FS binding alone constrains only the challenge derivation, not the
+/// trace cells).
+const LEXLT_PINS: usize = 512;
+
+/// Per-row eval for the pinned LexLt AIR: the base `a < b` constraints
+/// followed by `(cell − public_bit)` pins for every a-bit and b-bit.  Shared
+/// verbatim by the pinned prover (through `deep_ali_merge_per_row_no_layout`)
+/// and the verifier, so the composition and the per-query re-check are
+/// identical by construction.  `al`/`bl` are the public operands' 32-bit
+/// limbs (LSB-first within limb, matching `build_lex_lt_trace`).
+#[inline]
+fn lexlt_pinned_eval(cur: &[F], nxt: &[F], row: usize, al: &[u64; 8], bl: &[u64; 8]) -> Vec<F> {
+    use deep_ali::air_workloads::{LEXLT_ABIT0, LEXLT_BBIT0};
+    let mut c = evaluate_constraints(AirType::LexLt, cur, nxt, row);
+    for k in 0..8 { for j in 0..32 {
+        c.push(cur[LEXLT_ABIT0 + k * 32 + j] - F::from((al[k] >> j) & 1));
+    } }
+    for k in 0..8 { for j in 0..32 {
+        c.push(cur[LEXLT_BBIT0 + k * 32 + j] - F::from((bl[k] >> j) & 1));
+    } }
+    c
+}
+
 pub fn prove_lex_lt_bound(
     a:             &[u8; 32],
     b:             &[u8; 32],
@@ -1624,14 +1650,19 @@ pub fn prove_lex_lt_bound(
 ) -> LexLtBoundProof {
     assert!(a < b, "prove_lex_lt_bound requires a < b lexicographically");
     let n_trace = LEXLT_BOUND_N_TRACE;
-    let air     = AirType::LexLt;
+    let width   = AirType::LexLt.width();
+    let n_cons  = AirType::LexLt.num_constraints() + LEXLT_PINS;
+    let (al, bl) = (be32_to_limbs(a), be32_to_limbs(b));
     let fs_pub  = lex_lt_fs_pub(a, b, fs_binding_32);
-    let trace   = build_lex_lt_trace(n_trace, be32_to_limbs(a), be32_to_limbs(b));
+    let trace   = build_lex_lt_trace(n_trace, al, bl);
 
     let t0 = Instant::now();
     let proof = prove_one_sub_air_with_trace(
-        &trace, n_trace, BLOWUP, fs_pub, b"lex_lt_bound", air.num_constraints(),
-        |lde, nt, bw, cc| deep_ali_merge_general(lde, cc, air, F::from(0u64), nt, bw).0,
+        &trace, n_trace, BLOWUP, fs_pub, b"lex_lt_bound", n_cons,
+        |lde, nt, bw, cc| deep_ali::deep_ali_merge_per_row_no_layout(
+            lde, cc, F::from(0u64), nt, bw, width, n_cons,
+            |cur, nxt, row| lexlt_pinned_eval(cur, nxt, row, &al, &bl),
+        ).0,
         |n0, ph| nsec3_bound_params(n0, ldt, ph),
     );
     let prove_ms = t0.elapsed().as_secs_f64() * 1e3;
@@ -1639,9 +1670,10 @@ pub fn prove_lex_lt_bound(
 }
 
 /// Verify a witness-binding `a < b` proof.  Returns `true` only if the
-/// committed trace genuinely satisfies the `LexLt` constraints (re-checked at
-/// the authenticated query openings) under the `(a,b)` public inputs — so,
-/// unlike the bare `verify_lex_lt`, it does NOT accept an arbitrary `(a,b)`.
+/// committed trace genuinely satisfies the `LexLt` constraints AND its a/b
+/// bit-columns equal the PUBLIC `(a,b)` (the pins, re-checked at the
+/// authenticated query openings) — so, unlike the bare `verify_lex_lt`, it
+/// neither accepts an arbitrary `(a,b)` nor a trace encoding a different pair.
 pub fn verify_lex_lt_bound(
     bp:            &LexLtBoundProof,
     a:             &[u8; 32],
@@ -1649,12 +1681,14 @@ pub fn verify_lex_lt_bound(
     fs_binding_32: &[u8; 32],
     ldt:           LdtMode,
 ) -> bool {
-    let air    = AirType::LexLt;
+    let width  = AirType::LexLt.width();
+    let n_cons = AirType::LexLt.num_constraints() + LEXLT_PINS;
+    let (al, bl) = (be32_to_limbs(a), be32_to_limbs(b));
     let fs_pub = lex_lt_fs_pub(a, b, fs_binding_32);
     verify_one_sub_air_with_trace(
         &bp.proof, bp.n_trace, BLOWUP, fs_pub, b"lex_lt_bound",
-        air.width(), air.num_constraints(),
-        |cur, nxt, row| evaluate_constraints(air, cur, nxt, row),
+        width, n_cons,
+        |cur, nxt, row| lexlt_pinned_eval(cur, nxt, row, &al, &bl),
         |n0, ph| nsec3_bound_params(n0, ldt, ph),
     ).is_ok()
 }
@@ -5119,6 +5153,35 @@ mod lex_lt_bound_tests {
             |n0, ph| nsec3_bound_params(n0, ldt, ph),
         ).is_ok();
         assert!(!ok, "tampered LexLt trace (non-Boolean δ-bit) must be rejected by witness-binding");
+    }
+
+    #[test]
+    #[ignore = "prove path hits ark-ff 0.4.2 debug-assert; run --release --ignored"]
+    fn lex_lt_pin_rejects_trace_not_matching_public() {
+        // Malicious scenario: a trace that genuinely proves a2<b2, presented
+        // under the PUBLIC operands (a,b).  The a/b PINs (trace bits vs public
+        // bits) must reject it even though the base a<b constraints hold.
+        let (a, b)   = ([0x10u8;32], [0x20u8;32]);   // public
+        let (a2, b2) = ([0x30u8;32], [0x40u8;32]);   // trace actually encodes this
+        let ldt = LdtMode::Fri;
+        let n_trace = LEXLT_BOUND_N_TRACE;
+        let width = AirType::LexLt.width();
+        let n_cons = AirType::LexLt.num_constraints() + LEXLT_PINS;
+        let (al, bl) = (be32_to_limbs(&a), be32_to_limbs(&b));
+        let trace = build_lex_lt_trace(n_trace, be32_to_limbs(&a2), be32_to_limbs(&b2));
+        let fs_pub = lex_lt_fs_pub(&a, &b, &FSB);
+        let proof = prove_one_sub_air_with_trace(
+            &trace, n_trace, BLOWUP, fs_pub, b"lex_lt_bound", n_cons,
+            |lde, nt, bw, cc| deep_ali::deep_ali_merge_per_row_no_layout(
+                lde, cc, F::from(0u64), nt, bw, width, n_cons,
+                |cur, nxt, row| lexlt_pinned_eval(cur, nxt, row, &al, &bl)).0,
+            |n0, ph| nsec3_bound_params(n0, ldt, ph),
+        );
+        let ok = verify_one_sub_air_with_trace(
+            &proof, n_trace, BLOWUP, fs_pub, b"lex_lt_bound", width, n_cons,
+            |cur, nxt, row| lexlt_pinned_eval(cur, nxt, row, &al, &bl),
+            |n0, ph| nsec3_bound_params(n0, ldt, ph)).is_ok();
+        assert!(!ok, "pins must reject a trace whose a/b != the public (a,b)");
     }
 
     #[test]
