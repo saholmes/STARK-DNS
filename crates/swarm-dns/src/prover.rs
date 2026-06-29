@@ -1175,7 +1175,45 @@ pub struct Nsec3DenialBoundProof {
     pub proof:    SubAirProofWithTrace,
 }
 
-/// Witness-binding variant of [`prove_nsec3_nodata`] (N2 gadget).
+/// Public-input PIN count for the NSEC3 denial AIRs (`bit` + `sel` columns).
+const NSEC3_DENIAL_PINS: usize = 2;
+/// NODATA / wildcard trace height: 512 (the 256-bit window occupies rows
+/// 0..256; padding to 512 keeps the queried type's row off the gated last
+/// row, so even type 255 is pinned and constraint-checked).
+const NSEC3_NODATA_BOUND_N_TRACE: usize = 512;
+
+/// Per-row eval for the pinned NODATA / wildcard AIR: the `Nsec3NoData`
+/// constraints followed by pins binding the `bit` column to the PUBLIC type
+/// bitmap and the `sel` column to the PUBLIC queried type.  Without the pins
+/// the binding would prove "SOME bitmap has qtype absent"; the pins make it
+/// prove it about the PUBLIC record's bitmap.  Shared verbatim by the prover
+/// (via `deep_ali_merge_per_row_no_layout`) and verifier.
+#[inline]
+fn nsec3_nodata_pinned_eval(cur: &[F], nxt: &[F], row: usize, bitmap: &[u8; 32], qtype: u16) -> Vec<F> {
+    let mut c = evaluate_constraints(AirType::Nsec3NoData, cur, nxt, row);
+    let want_bit = if row < 256 && nsec3_type_present(bitmap, row as u8) { F::from(1u64) } else { F::from(0u64) };
+    let want_sel = if row == qtype as usize { F::from(1u64) } else { F::from(0u64) };
+    c.push(cur[0] - want_bit); // pin `bit` column → public bitmap bit at this type
+    c.push(cur[1] - want_sel); // pin `sel` column → public queried type
+    c
+}
+
+/// Per-row eval for the pinned Opt-Out AIR: the `Nsec3OptOut` constraints
+/// followed by pins binding the `bit` column to the PUBLIC Flags octet and
+/// the `sel` column to the Opt-Out bit index.
+#[inline]
+fn nsec3_optout_pinned_eval(cur: &[F], nxt: &[F], row: usize, flags: u8) -> Vec<F> {
+    let mut c = evaluate_constraints(AirType::Nsec3OptOut, cur, nxt, row);
+    let want_bit = if row < 8 && ((flags >> row) & 1) == 1 { F::from(1u64) } else { F::from(0u64) };
+    let want_sel = if row == NSEC3_OPTOUT_BIT { F::from(1u64) } else { F::from(0u64) };
+    c.push(cur[0] - want_bit); // pin `bit` column → public Flags octet bit
+    c.push(cur[1] - want_sel); // pin `sel` column → Opt-Out bit index
+    c
+}
+
+/// Witness-binding variant of [`prove_nsec3_nodata`] (N2 gadget), with the
+/// trace bitmap/qtype pinned to the public record (see
+/// [`nsec3_nodata_pinned_eval`]).
 pub fn prove_nsec3_nodata_bound(
     record:        &Nsec3TypedRecord,
     qname_hash:    &[u8; 32],
@@ -1190,15 +1228,20 @@ pub fn prove_nsec3_nodata_bound(
     assert!(!nsec3_type_present(&record.type_bitmap, qtype as u8),
         "type {qtype} is present in the bitmap — this is a positive answer, not NODATA");
 
-    let n_trace = 256usize;
-    let air     = AirType::Nsec3NoData;
+    let n_trace = NSEC3_NODATA_BOUND_N_TRACE;
+    let width   = AirType::Nsec3NoData.width();
+    let n_cons  = AirType::Nsec3NoData.num_constraints() + NSEC3_DENIAL_PINS;
+    let bitmap  = record.type_bitmap;
     let fs_pub  = nsec3_nodata_fs_pub(record, qtype, salt, fs_binding_32);
     let trace   = build_nsec3_nodata_trace(n_trace, qtype, &record.type_bitmap);
 
     let t0 = Instant::now();
     let proof = prove_one_sub_air_with_trace(
-        &trace, n_trace, BLOWUP, fs_pub, b"nsec3_nodata_bound", air.num_constraints(),
-        |lde, nt, bw, cc| deep_ali_merge_general(lde, cc, air, F::from(0u64), nt, bw).0,
+        &trace, n_trace, BLOWUP, fs_pub, b"nsec3_nodata_bound", n_cons,
+        |lde, nt, bw, cc| deep_ali::deep_ali_merge_per_row_no_layout(
+            lde, cc, F::from(0u64), nt, bw, width, n_cons,
+            |cur, nxt, row| nsec3_nodata_pinned_eval(cur, nxt, row, &bitmap, qtype),
+        ).0,
         |n0, ph| nsec3_bound_params(n0, ldt, ph),
     );
     let prove_ms = t0.elapsed().as_secs_f64() * 1e3;
@@ -1206,8 +1249,9 @@ pub fn prove_nsec3_nodata_bound(
 }
 
 /// Verify a witness-binding NODATA proof.  Returns `true` only if the
-/// committed trace genuinely satisfies the `Nsec3NoData` constraints
-/// (re-checked at the authenticated query openings) under the public inputs.
+/// committed trace satisfies `Nsec3NoData` AND its bitmap/sel columns equal
+/// the PUBLIC record's bitmap and queried type (pins, re-checked at the query
+/// openings).
 pub fn verify_nsec3_nodata_bound(
     bp:            &Nsec3DenialBoundProof,
     record:        &Nsec3TypedRecord,
@@ -1218,17 +1262,22 @@ pub fn verify_nsec3_nodata_bound(
     ldt:           LdtMode,
 ) -> bool {
     if qtype >= 256 || &record.owner_hash != qname_hash { return false; }
-    let air    = AirType::Nsec3NoData;
-    let fs_pub = nsec3_nodata_fs_pub(record, qtype, salt, fs_binding_32);
+    let width   = AirType::Nsec3NoData.width();
+    let n_cons  = AirType::Nsec3NoData.num_constraints() + NSEC3_DENIAL_PINS;
+    let bitmap  = record.type_bitmap;
+    let fs_pub  = nsec3_nodata_fs_pub(record, qtype, salt, fs_binding_32);
     verify_one_sub_air_with_trace(
         &bp.proof, bp.n_trace, BLOWUP, fs_pub, b"nsec3_nodata_bound",
-        air.width(), air.num_constraints(),
-        |cur, nxt, row| evaluate_constraints(air, cur, nxt, row),
+        width, n_cons,
+        |cur, nxt, row| nsec3_nodata_pinned_eval(cur, nxt, row, &bitmap, qtype),
         |n0, ph| nsec3_bound_params(n0, ldt, ph),
     ).is_ok()
 }
 
-/// Witness-binding variant of [`prove_nsec3_optout`] (N3 gadget).
+/// Witness-binding variant of [`prove_nsec3_optout`] (N3 gadget), with the
+/// trace Flags octet pinned to the public value (see
+/// [`nsec3_optout_pinned_eval`]).  Padded to 256 rows so the binding query
+/// mechanism does not false-reject (cf. the small-domain note in tier-2).
 pub fn prove_nsec3_optout_bound(
     owner:         &[u8; 32],
     next:          &[u8; 32],
@@ -1243,24 +1292,19 @@ pub fn prove_nsec3_optout_bound(
     assert!(optout_set(flags),
         "Opt-Out flag is clear — elision of this delegation is unauthorised");
 
-    // The Opt-Out AIR encodes the 8 Flags-octet bits in rows 0..8; rows 8..n
-    // are all-zero and trivially satisfy the (local, per-row) constraints.  We
-    // pad to 256 (matching the NODATA / wildcard provers): the bare 8-row
-    // trace gives an n0 = 8·BLOWUP = 256 low-degree-test domain so small that
-    // the binding FRI query mechanism *false-rejects* an honest proof (a
-    // completeness failure — tamper still rejects, so soundness is intact; the
-    // non-binding variant above never opens the trace, so it was unaffected).
-    // Padding is semantically inert — the meaningful constraint is on rows
-    // 0..8 and the Flags value is bound via `fs_pub`.
     let n_trace = 256usize;
-    let air     = AirType::Nsec3OptOut;
+    let width   = AirType::Nsec3OptOut.width();
+    let n_cons  = AirType::Nsec3OptOut.num_constraints() + NSEC3_DENIAL_PINS;
     let fs_pub  = nsec3_optout_fs_pub(owner, next, flags, deleg_hash, salt, fs_binding_32);
     let trace   = build_nsec3_optout_trace(n_trace, NSEC3_OPTOUT_BIT, flags);
 
     let t0 = Instant::now();
     let proof = prove_one_sub_air_with_trace(
-        &trace, n_trace, BLOWUP, fs_pub, b"nsec3_optout_bound", air.num_constraints(),
-        |lde, nt, bw, cc| deep_ali_merge_general(lde, cc, air, F::from(0u64), nt, bw).0,
+        &trace, n_trace, BLOWUP, fs_pub, b"nsec3_optout_bound", n_cons,
+        |lde, nt, bw, cc| deep_ali::deep_ali_merge_per_row_no_layout(
+            lde, cc, F::from(0u64), nt, bw, width, n_cons,
+            |cur, nxt, row| nsec3_optout_pinned_eval(cur, nxt, row, flags),
+        ).0,
         |n0, ph| nsec3_bound_params(n0, ldt, ph),
     );
     let prove_ms = t0.elapsed().as_secs_f64() * 1e3;
@@ -1268,8 +1312,8 @@ pub fn prove_nsec3_optout_bound(
 }
 
 /// Verify a witness-binding Opt-Out elision proof.  Returns `true` only if
-/// the committed Flags-octet trace genuinely satisfies the `Nsec3OptOut`
-/// constraints (Opt-Out bit set) under the public inputs.
+/// the committed Flags trace satisfies `Nsec3OptOut` AND its `bit` column
+/// equals the PUBLIC Flags octet (pins, re-checked at the query openings).
 pub fn verify_nsec3_optout_bound(
     bp:            &Nsec3DenialBoundProof,
     owner:         &[u8; 32],
@@ -1281,18 +1325,19 @@ pub fn verify_nsec3_optout_bound(
     ldt:           LdtMode,
 ) -> bool {
     if !nsec3_covers(owner, next, deleg_hash) { return false; }
-    let air    = AirType::Nsec3OptOut;
-    let fs_pub = nsec3_optout_fs_pub(owner, next, flags, deleg_hash, salt, fs_binding_32);
+    let width   = AirType::Nsec3OptOut.width();
+    let n_cons  = AirType::Nsec3OptOut.num_constraints() + NSEC3_DENIAL_PINS;
+    let fs_pub  = nsec3_optout_fs_pub(owner, next, flags, deleg_hash, salt, fs_binding_32);
     verify_one_sub_air_with_trace(
         &bp.proof, bp.n_trace, BLOWUP, fs_pub, b"nsec3_optout_bound",
-        air.width(), air.num_constraints(),
-        |cur, nxt, row| evaluate_constraints(air, cur, nxt, row),
+        width, n_cons,
+        |cur, nxt, row| nsec3_optout_pinned_eval(cur, nxt, row, flags),
         |n0, ph| nsec3_bound_params(n0, ldt, ph),
     ).is_ok()
 }
 
 /// Witness-binding variant of [`prove_nsec3_wildcard_closure`] (reuses the N2
-/// `Nsec3NoData` non-coverage AIR over the wildcard record's type bitmap).
+/// `Nsec3NoData` AIR over the wildcard record's bitmap, pinned to it).
 pub fn prove_nsec3_wildcard_closure_bound(
     ce_hash:       &[u8; 32],
     wildcard:      &Nsec3TypedRecord,
@@ -1306,15 +1351,20 @@ pub fn prove_nsec3_wildcard_closure_bound(
     assert!(!nsec3_type_present(&wildcard.type_bitmap, qtype as u8),
         "wildcard covers type {qtype} — it WOULD synthesise; closure fails");
 
-    let n_trace = 256usize;
-    let air     = AirType::Nsec3NoData;
+    let n_trace = NSEC3_NODATA_BOUND_N_TRACE;
+    let width   = AirType::Nsec3NoData.width();
+    let n_cons  = AirType::Nsec3NoData.num_constraints() + NSEC3_DENIAL_PINS;
+    let bitmap  = wildcard.type_bitmap;
     let fs_pub  = nsec3_wildcard_fs_pub(ce_hash, wildcard, qname_hash, qtype, salt, fs_binding_32);
     let trace   = build_nsec3_nodata_trace(n_trace, qtype, &wildcard.type_bitmap);
 
     let t0 = Instant::now();
     let proof = prove_one_sub_air_with_trace(
-        &trace, n_trace, BLOWUP, fs_pub, b"nsec3_wildcard_bound", air.num_constraints(),
-        |lde, nt, bw, cc| deep_ali_merge_general(lde, cc, air, F::from(0u64), nt, bw).0,
+        &trace, n_trace, BLOWUP, fs_pub, b"nsec3_wildcard_bound", n_cons,
+        |lde, nt, bw, cc| deep_ali::deep_ali_merge_per_row_no_layout(
+            lde, cc, F::from(0u64), nt, bw, width, n_cons,
+            |cur, nxt, row| nsec3_nodata_pinned_eval(cur, nxt, row, &bitmap, qtype),
+        ).0,
         |n0, ph| nsec3_bound_params(n0, ldt, ph),
     );
     let prove_ms = t0.elapsed().as_secs_f64() * 1e3;
@@ -1322,8 +1372,8 @@ pub fn prove_nsec3_wildcard_closure_bound(
 }
 
 /// Verify a witness-binding wildcard-closure proof.  Returns `true` only if
-/// the committed bitmap trace genuinely satisfies `Nsec3NoData` (queried type
-/// absent from the wildcard) under the public inputs.
+/// the committed trace satisfies `Nsec3NoData` AND its bitmap/sel columns
+/// equal the PUBLIC wildcard's bitmap and queried type (pins).
 pub fn verify_nsec3_wildcard_closure_bound(
     bp:                     &Nsec3DenialBoundProof,
     ce_hash:                &[u8; 32],
@@ -1336,12 +1386,14 @@ pub fn verify_nsec3_wildcard_closure_bound(
     ldt:                    LdtMode,
 ) -> bool {
     if qtype >= 256 || &wildcard.owner_hash != expected_wildcard_hash { return false; }
-    let air    = AirType::Nsec3NoData;
-    let fs_pub = nsec3_wildcard_fs_pub(ce_hash, wildcard, qname_hash, qtype, salt, fs_binding_32);
+    let width   = AirType::Nsec3NoData.width();
+    let n_cons  = AirType::Nsec3NoData.num_constraints() + NSEC3_DENIAL_PINS;
+    let bitmap  = wildcard.type_bitmap;
+    let fs_pub  = nsec3_wildcard_fs_pub(ce_hash, wildcard, qname_hash, qtype, salt, fs_binding_32);
     verify_one_sub_air_with_trace(
         &bp.proof, bp.n_trace, BLOWUP, fs_pub, b"nsec3_wildcard_bound",
-        air.width(), air.num_constraints(),
-        |cur, nxt, row| evaluate_constraints(air, cur, nxt, row),
+        width, n_cons,
+        |cur, nxt, row| nsec3_nodata_pinned_eval(cur, nxt, row, &bitmap, qtype),
         |n0, ph| nsec3_bound_params(n0, ldt, ph),
     ).is_ok()
 }
@@ -4984,6 +5036,39 @@ mod nsec3_bound_tests {
         let bp = prove_nsec3_wildcard_closure_bound(&ce, &wc, &qn, qtype, &SALT, &FSB, ldt);
         assert!(verify_nsec3_wildcard_closure_bound(&bp, &ce, &wc, &wc_owner, &qn, qtype, &SALT, &FSB, ldt),
             "honest wildcard closure must verify");
+    }
+
+    #[test]
+    #[ignore = "prove path hits ark-ff 0.4.2 debug-assert; run --release --ignored"]
+    fn nodata_pin_rejects_fake_bitmap() {
+        // The forgery the pins must block: prove NODATA for a PUBLIC bitmap
+        // that actually CONTAINS the queried type, by sneaking in a fake trace
+        // bitmap (qtype absent).  The base constraints are satisfiable on the
+        // fake bitmap, but the bit-column pins (trace vs PUBLIC bitmap) must
+        // reject it.
+        let qtype = 28u16;
+        let mut pub_bm = [0u8; 32]; set_type_bit(&mut pub_bm, qtype); // PUBLIC: qtype PRESENT
+        let mut fake_bm = [0u8; 32]; set_type_bit(&mut fake_bm, 1);   // trace: qtype ABSENT
+        let ldt = LdtMode::Fri;
+        let n_trace = NSEC3_NODATA_BOUND_N_TRACE;
+        let width = AirType::Nsec3NoData.width();
+        let n_cons = AirType::Nsec3NoData.num_constraints() + NSEC3_DENIAL_PINS;
+        let trace = build_nsec3_nodata_trace(n_trace, qtype, &fake_bm);
+        let owner = [0x11u8; 32];
+        let rec_pub = Nsec3TypedRecord { owner_hash: owner, next_hash: [0x22; 32], type_bitmap: pub_bm };
+        let fs_pub = nsec3_nodata_fs_pub(&rec_pub, qtype, &SALT, &FSB);
+        let proof = prove_one_sub_air_with_trace(
+            &trace, n_trace, BLOWUP, fs_pub, b"nsec3_nodata_bound", n_cons,
+            |lde, nt, bw, cc| deep_ali::deep_ali_merge_per_row_no_layout(
+                lde, cc, F::from(0u64), nt, bw, width, n_cons,
+                |cur, nxt, row| nsec3_nodata_pinned_eval(cur, nxt, row, &pub_bm, qtype)).0,
+            |n0, ph| nsec3_bound_params(n0, ldt, ph),
+        );
+        let ok = verify_one_sub_air_with_trace(
+            &proof, n_trace, BLOWUP, fs_pub, b"nsec3_nodata_bound", width, n_cons,
+            |cur, nxt, row| nsec3_nodata_pinned_eval(cur, nxt, row, &pub_bm, qtype),
+            |n0, ph| nsec3_bound_params(n0, ldt, ph)).is_ok();
+        assert!(!ok, "pins must reject a fake trace bitmap when the PUBLIC bitmap HAS the queried type");
     }
 }
 
