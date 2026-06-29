@@ -1817,7 +1817,10 @@ mod tests {
             .ok().and_then(|s| s.parse().ok()).unwrap_or(4);
         let level = crate::stark_level::NIST_LEVEL;
         let scheme = crate::ml_dsa::params::SCHEME_NAME;
-        let r = crate::stark_level::NUM_QUERIES_LEVEL;
+        // Match what `v2_fri_params` actually uses for THIS blowup (the
+        // displayed r was previously the b=32 floor `NUM_QUERIES_LEVEL`, which
+        // mislabelled the sound count at the bench's inner blowup).
+        let r = crate::stark_level::num_queries_for_blowup(blowup);
         let hash_label = match level {
             1 => "SHA3-256",
             3 => "SHA3-384",

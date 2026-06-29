@@ -78,9 +78,13 @@ fn mk_params(n0: usize, r: usize, use_stir: bool, ph: [u8; 32]) -> DeepFriParams
 fn main() {
     let level = deep_ali::stark_level::NIST_LEVEL;
     let ext_deg = deep_ali::permutation_argument::EXT_DEGREE;
-    let r = deep_ali::stark_level::NUM_QUERIES_LEVEL;
     let use_stir = matches!(std::env::var("BENCH_LDT").as_deref(), Ok("stir") | Ok("STIR"));
     let blowup = std::env::var("BENCH_BLOWUP").ok().and_then(|s| s.parse().ok()).unwrap_or(2usize);
+    // r MUST track the blowup via the slack-Johnson bound: the b=32 floor
+    // (55/81/108) is UNSOUND at lower blowup (~24 bits at b=2, ~51 at b=4).
+    // num_queries_for_blowup gives the sound query count for the active NIST
+    // level at THIS blowup (e.g. 308/461/615 at b=2 for L1/L3/L5).
+    let r = deep_ali::stark_level::num_queries_for_blowup(blowup);
     // DEFAULT k_scalar = 256: the real Ed25519 scalar width, at which the
     // cofactored VERDICT (s·B = R + k·A) is enforced and closes on a real
     // signature.  BENCH_K_SCALAR<256 is a light computation-only mode

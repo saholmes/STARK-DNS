@@ -141,9 +141,12 @@ fn derive_case(key_bytes: &[u8; 32], msg: &[u8], k: usize) -> SigCase {
 fn main() {
     let level = deep_ali::stark_level::NIST_LEVEL;
     let ext_deg = deep_ali::permutation_argument::EXT_DEGREE;
-    let r = deep_ali::stark_level::NUM_QUERIES_LEVEL;
     let use_stir = matches!(std::env::var("BENCH_LDT").as_deref(), Ok("stir") | Ok("STIR"));
     let blowup = std::env::var("BENCH_BLOWUP").ok().and_then(|s| s.parse().ok()).unwrap_or(4usize);
+    // r MUST track the blowup via the slack-Johnson bound: 55/81/108 is the
+    // b=32 floor and is UNSOUND at b=4 (~51 bits).  num_queries_for_blowup
+    // gives the sound count at THIS blowup (≈143/214/284 at b=4 for L1/L3/L5).
+    let r = deep_ali::stark_level::num_queries_for_blowup(blowup);
     let k = std::env::var("KSTEPS").ok().and_then(|s| s.parse().ok()).unwrap_or(256usize);
     let n_trace = (k + 1).next_power_of_two();
     eprintln!("=== ecdsa_verify_multirow_bound_bench: END-TO-END + PUBLIC-INPUT-BOUND P256 ECDSA verify, \

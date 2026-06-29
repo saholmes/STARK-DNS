@@ -119,7 +119,8 @@ fn main() {
     let level = deep_ali::stark_level::NIST_LEVEL;
     let ext_deg = deep_ali::permutation_argument::EXT_DEGREE;
     let blowup = 32usize;
-    let r = deep_ali::stark_level::NUM_QUERIES_LEVEL; // slack floor 55/81/108
+    // sound query count for THIS blowup (= 55/81/108 at b=32, the slack floor).
+    let r = deep_ali::stark_level::num_queries_for_blowup(blowup);
     let use_stir = matches!(std::env::var("BENCH_LDT").as_deref(), Ok("stir") | Ok("STIR"));
     let n_trace = 32usize;
     eprintln!("=== rsa2048_exp_bound_bench: WITNESS-BINDING compact RSA exp AIR, \
