@@ -1583,6 +1583,133 @@ pub fn verify_nsec3_cover(
     Ok(())
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+//  Witness-binding lexicographic cover (F1) — bound LexLt + bound cover
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// Sound counterparts to `prove_lex_lt` / `prove_nsec3_cover`.  The LexLt AIR's
+// constraints already SOUNDLY express `a < b` (δ-bits Boolean ⇒ δ ≥ 0; the
+// per-limb borrow-subtraction with a zero final carry-out forces
+// `b = a + 1 + δ` as integers ⇒ `b > a`).  What the bare `verify_lex_lt`
+// lacked was *witness-binding*: `deep_fri_verify` only tests low-degreeness,
+// so it accepted ANY `(a,b)` regardless of whether the committed trace
+// actually satisfied those constraints.  Routing through
+// `prove_one_sub_air_with_trace` (re-checking the constraints at every
+// authenticated query opening) closes the gap: a trace that does not encode a
+// genuine `a < b` (a wrong δ, a non-Boolean bit) is rejected in-circuit.
+//
+// LexLt is a LOCAL, row-independent AIR, so — unlike the SHA-256 transition
+// AIR — its final row also satisfies the constraints and needs no merge
+// last-row gate.  We pad `n_trace` to 256 (every row carries the same valid
+// (a,b,δ,carry) assignment): the bare 8-row trace's n0 = 256 LDT domain is
+// too small for the binding query mechanism (false-rejects honest proofs; cf.
+// the Opt-Out prover).  `cover` composes two bound LexLt proofs for the
+// mode's operand roles, fully in-circuit (no native byte comparison).
+
+const LEXLT_BOUND_N_TRACE: usize = 256;
+
+/// Witness-binding `a < b` proof (the full `SubAirProofWithTrace`).
+pub struct LexLtBoundProof {
+    pub n_trace:  usize,
+    pub prove_ms: f64,
+    pub proof:    SubAirProofWithTrace,
+}
+
+/// Witness-binding variant of [`prove_lex_lt`].
+pub fn prove_lex_lt_bound(
+    a:             &[u8; 32],
+    b:             &[u8; 32],
+    fs_binding_32: &[u8; 32],
+    ldt:           LdtMode,
+) -> LexLtBoundProof {
+    assert!(a < b, "prove_lex_lt_bound requires a < b lexicographically");
+    let n_trace = LEXLT_BOUND_N_TRACE;
+    let air     = AirType::LexLt;
+    let fs_pub  = lex_lt_fs_pub(a, b, fs_binding_32);
+    let trace   = build_lex_lt_trace(n_trace, be32_to_limbs(a), be32_to_limbs(b));
+
+    let t0 = Instant::now();
+    let proof = prove_one_sub_air_with_trace(
+        &trace, n_trace, BLOWUP, fs_pub, b"lex_lt_bound", air.num_constraints(),
+        |lde, nt, bw, cc| deep_ali_merge_general(lde, cc, air, F::from(0u64), nt, bw).0,
+        |n0, ph| nsec3_bound_params(n0, ldt, ph),
+    );
+    let prove_ms = t0.elapsed().as_secs_f64() * 1e3;
+    LexLtBoundProof { n_trace, prove_ms, proof }
+}
+
+/// Verify a witness-binding `a < b` proof.  Returns `true` only if the
+/// committed trace genuinely satisfies the `LexLt` constraints (re-checked at
+/// the authenticated query openings) under the `(a,b)` public inputs — so,
+/// unlike the bare `verify_lex_lt`, it does NOT accept an arbitrary `(a,b)`.
+pub fn verify_lex_lt_bound(
+    bp:            &LexLtBoundProof,
+    a:             &[u8; 32],
+    b:             &[u8; 32],
+    fs_binding_32: &[u8; 32],
+    ldt:           LdtMode,
+) -> bool {
+    let air    = AirType::LexLt;
+    let fs_pub = lex_lt_fs_pub(a, b, fs_binding_32);
+    verify_one_sub_air_with_trace(
+        &bp.proof, bp.n_trace, BLOWUP, fs_pub, b"lex_lt_bound",
+        air.width(), air.num_constraints(),
+        |cur, nxt, row| evaluate_constraints(air, cur, nxt, row),
+        |n0, ph| nsec3_bound_params(n0, ldt, ph),
+    ).is_ok()
+}
+
+/// Witness-binding cyclic-cover proof: two bound LexLt sub-proofs for the
+/// mode's operand roles.
+pub struct Nsec3CoverBoundProof {
+    pub mode: CoverMode,
+    pub lt1:  LexLtBoundProof,
+    pub lt2:  LexLtBoundProof,
+}
+
+/// Witness-binding variant of [`prove_nsec3_cover`].  Panics if `q` is not
+/// covered (caller bug); the prover uses native comparison only to SELECT the
+/// mode — the verifier does none.
+pub fn prove_nsec3_cover_bound(
+    owner:         &[u8; 32],
+    q:             &[u8; 32],
+    next:          &[u8; 32],
+    fs_binding_32: &[u8; 32],
+    ldt:           LdtMode,
+) -> Nsec3CoverBoundProof {
+    let mode = if owner < next {
+        assert!(owner < q && q < next, "q not inside normal interval (owner, next)");
+        CoverMode::Interior
+    } else if q > owner {
+        CoverMode::WrapUpper
+    } else if q < next {
+        CoverMode::WrapLower
+    } else {
+        panic!("q not covered by wrap interval (owner, next)");
+    };
+    let ((a1, b1), (a2, b2)) = cover_roles(mode, owner, q, next);
+    let lt1 = prove_lex_lt_bound(a1, b1, fs_binding_32, ldt);
+    let lt2 = prove_lex_lt_bound(a2, b2, fs_binding_32, ldt);
+    Nsec3CoverBoundProof { mode, lt1, lt2 }
+}
+
+/// Verify a witness-binding cyclic-cover proof: both bound LexLt sub-proofs
+/// must verify for the mode's operand roles.  Each sub-proof's `fs_pub` binds
+/// its `(a,b)` operands, so the pair soundly establishes `q ∈ (owner, next)`
+/// cyclically with NO native byte comparison.
+pub fn verify_nsec3_cover_bound(
+    proof:         &Nsec3CoverBoundProof,
+    owner:         &[u8; 32],
+    q:             &[u8; 32],
+    next:          &[u8; 32],
+    fs_binding_32: &[u8; 32],
+    ldt:           LdtMode,
+) -> bool {
+    let ((a1, b1), (a2, b2)) = cover_roles(proof.mode, owner, q, next);
+    verify_lex_lt_bound(&proof.lt1, a1, b1, fs_binding_32, ldt)
+        && verify_lex_lt_bound(&proof.lt2, a2, b2, fs_binding_32, ldt)
+}
+
 // ═══════════════════════════════════════════════════════════════════
 //  DS → KSK binding (single STARK over multi-block SHA-256)
 // ═══════════════════════════════════════════════════════════════════
@@ -4953,3 +5080,60 @@ mod ds_ksk_bound_tests {
 }
 
 
+
+#[cfg(test)]
+mod lex_lt_bound_tests {
+    use super::*;
+
+    const FSB: [u8; 32] = [0x1C; 32];
+
+    #[test]
+    #[ignore = "prove path hits ark-ff 0.4.2 debug-assert; run --release --ignored"]
+    fn lex_lt_bound_honest_accept_cross_and_tamper_reject() {
+        let a = [0x10u8; 32];
+        let b = [0x20u8; 32]; // a < b
+        let ldt = LdtMode::Fri;
+
+        let bp = prove_lex_lt_bound(&a, &b, &FSB, ldt);
+        assert!(verify_lex_lt_bound(&bp, &a, &b, &FSB, ldt), "honest a<b must verify");
+
+        // Cross-statement: verify the (a,b) proof under swapped operands → reject.
+        assert!(!verify_lex_lt_bound(&bp, &b, &a, &FSB, ldt),
+            "a<b proof must not verify under swapped (b,a) public inputs");
+
+        // Tamper: a trace with a non-Boolean δ-bit violates the LexLt AIR.
+        let n_trace = LEXLT_BOUND_N_TRACE;
+        let air = AirType::LexLt;
+        let mut trace = build_lex_lt_trace(n_trace, be32_to_limbs(&a), be32_to_limbs(&b));
+        trace[deep_ali::air_workloads::LEXLT_DBIT0][5] = F::from(2u64); // non-Boolean
+        let fs_pub = lex_lt_fs_pub(&a, &b, &FSB);
+        let proof = prove_one_sub_air_with_trace(
+            &trace, n_trace, BLOWUP, fs_pub, b"lex_lt_bound", air.num_constraints(),
+            |lde, nt, bw, cc| deep_ali_merge_general(lde, cc, air, F::from(0u64), nt, bw).0,
+            |n0, ph| nsec3_bound_params(n0, ldt, ph),
+        );
+        let ok = verify_one_sub_air_with_trace(
+            &proof, n_trace, BLOWUP, fs_pub, b"lex_lt_bound",
+            air.width(), air.num_constraints(),
+            |cur, nxt, row| evaluate_constraints(air, cur, nxt, row),
+            |n0, ph| nsec3_bound_params(n0, ldt, ph),
+        ).is_ok();
+        assert!(!ok, "tampered LexLt trace (non-Boolean δ-bit) must be rejected by witness-binding");
+    }
+
+    #[test]
+    #[ignore = "prove path hits ark-ff 0.4.2 debug-assert; run --release --ignored"]
+    fn cover_bound_interior_and_wrap_accept() {
+        let ldt = LdtMode::Fri;
+        // Interior: owner < q < next.
+        let (owner, q, next) = ([0x10u8;32], [0x50u8;32], [0x90u8;32]);
+        let cp = prove_nsec3_cover_bound(&owner, &q, &next, &FSB, ldt);
+        assert!(verify_nsec3_cover_bound(&cp, &owner, &q, &next, &FSB, ldt),
+            "interior cover must verify");
+        // Wrap: next < owner, q above owner (WrapUpper).
+        let (owner, q, next) = ([0x80u8;32], [0xF0u8;32], [0x20u8;32]);
+        let cp = prove_nsec3_cover_bound(&owner, &q, &next, &FSB, ldt);
+        assert!(verify_nsec3_cover_bound(&cp, &owner, &q, &next, &FSB, ldt),
+            "wrap-upper cover must verify");
+    }
+}
