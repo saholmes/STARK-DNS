@@ -1148,6 +1148,205 @@ pub fn verify_nsec3_wildcard_closure(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+//  Witness-binding NSEC3 denial-of-existence provers (N2 / N3 / wildcard)
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// Sound counterparts to `prove_nsec3_nodata` / `prove_nsec3_optout` /
+// `prove_nsec3_wildcard_closure`, mirroring `prove_nsec3_completeness_bound`:
+// each routes the existing Nsec3NoData / Nsec3OptOut AIR through
+// `prove_one_sub_air_with_trace`, so the trace LDE is Merkle-committed (root
+// folded into the Fiat–Shamir public input) and the verifier re-checks
+// `c_eval(x)·Z_H(x) = Σ α_j Φ_j(trace[x])` at every authenticated FRI query
+// opening.  A trace that violates the AIR — a NODATA proof whose queried type
+// is actually PRESENT, or an Opt-Out proof over a record whose Opt-Out bit is
+// clear — is therefore rejected *in-circuit*, not merely shown low-degree.
+// The bare-`deep_fri_prove` variants above are retained for the
+// `proof_blob`/`DeepFriProof` consumers (offline resolver, fast-track, epoch);
+// these `_bound` variants are the S_ic-sound path.  The complete sound proof
+// is the `SubAirProofWithTrace` (low-degree test plus the 2·r·w trace-cell
+// openings); per-prover `fs_pub` is the Fiat–Shamir public-input hash, so a
+// proof for one statement is rejected under another's public inputs.
+
+/// Witness-binding NSEC3 denial-of-existence proof (NODATA / Opt-Out /
+/// wildcard-closure).  The bound proof is the full `SubAirProofWithTrace`.
+pub struct Nsec3DenialBoundProof {
+    pub n_trace:  usize,
+    pub prove_ms: f64,
+    pub proof:    SubAirProofWithTrace,
+}
+
+/// Witness-binding variant of [`prove_nsec3_nodata`] (N2 gadget).
+pub fn prove_nsec3_nodata_bound(
+    record:        &Nsec3TypedRecord,
+    qname_hash:    &[u8; 32],
+    qtype:         u16,
+    salt:          &[u8; 16],
+    fs_binding_32: &[u8; 32],
+    ldt:           LdtMode,
+) -> Nsec3DenialBoundProof {
+    assert!(qtype < 256, "qtype {qtype} outside NSEC3 window 0 (0..255)");
+    assert_eq!(&record.owner_hash, qname_hash,
+        "NODATA requires the queried name to exist: owner_hash != H(qname)");
+    assert!(!nsec3_type_present(&record.type_bitmap, qtype as u8),
+        "type {qtype} is present in the bitmap — this is a positive answer, not NODATA");
+
+    let n_trace = 256usize;
+    let air     = AirType::Nsec3NoData;
+    let fs_pub  = nsec3_nodata_fs_pub(record, qtype, salt, fs_binding_32);
+    let trace   = build_nsec3_nodata_trace(n_trace, qtype, &record.type_bitmap);
+
+    let t0 = Instant::now();
+    let proof = prove_one_sub_air_with_trace(
+        &trace, n_trace, BLOWUP, fs_pub, b"nsec3_nodata_bound", air.num_constraints(),
+        |lde, nt, bw, cc| deep_ali_merge_general(lde, cc, air, F::from(0u64), nt, bw).0,
+        |n0, ph| nsec3_bound_params(n0, ldt, ph),
+    );
+    let prove_ms = t0.elapsed().as_secs_f64() * 1e3;
+    Nsec3DenialBoundProof { n_trace, prove_ms, proof }
+}
+
+/// Verify a witness-binding NODATA proof.  Returns `true` only if the
+/// committed trace genuinely satisfies the `Nsec3NoData` constraints
+/// (re-checked at the authenticated query openings) under the public inputs.
+pub fn verify_nsec3_nodata_bound(
+    bp:            &Nsec3DenialBoundProof,
+    record:        &Nsec3TypedRecord,
+    qname_hash:    &[u8; 32],
+    qtype:         u16,
+    salt:          &[u8; 16],
+    fs_binding_32: &[u8; 32],
+    ldt:           LdtMode,
+) -> bool {
+    if qtype >= 256 || &record.owner_hash != qname_hash { return false; }
+    let air    = AirType::Nsec3NoData;
+    let fs_pub = nsec3_nodata_fs_pub(record, qtype, salt, fs_binding_32);
+    verify_one_sub_air_with_trace(
+        &bp.proof, bp.n_trace, BLOWUP, fs_pub, b"nsec3_nodata_bound",
+        air.width(), air.num_constraints(),
+        |cur, nxt, row| evaluate_constraints(air, cur, nxt, row),
+        |n0, ph| nsec3_bound_params(n0, ldt, ph),
+    ).is_ok()
+}
+
+/// Witness-binding variant of [`prove_nsec3_optout`] (N3 gadget).
+pub fn prove_nsec3_optout_bound(
+    owner:         &[u8; 32],
+    next:          &[u8; 32],
+    flags:         u8,
+    deleg_hash:    &[u8; 32],
+    salt:          &[u8; 16],
+    fs_binding_32: &[u8; 32],
+    ldt:           LdtMode,
+) -> Nsec3DenialBoundProof {
+    assert!(nsec3_covers(owner, next, deleg_hash),
+        "covering NSEC3 record does not bracket the delegation hash");
+    assert!(optout_set(flags),
+        "Opt-Out flag is clear — elision of this delegation is unauthorised");
+
+    // The Opt-Out AIR encodes the 8 Flags-octet bits in rows 0..8; rows 8..n
+    // are all-zero and trivially satisfy the (local, per-row) constraints.  We
+    // pad to 256 (matching the NODATA / wildcard provers): the bare 8-row
+    // trace gives an n0 = 8·BLOWUP = 256 low-degree-test domain so small that
+    // the binding FRI query mechanism *false-rejects* an honest proof (a
+    // completeness failure — tamper still rejects, so soundness is intact; the
+    // non-binding variant above never opens the trace, so it was unaffected).
+    // Padding is semantically inert — the meaningful constraint is on rows
+    // 0..8 and the Flags value is bound via `fs_pub`.
+    let n_trace = 256usize;
+    let air     = AirType::Nsec3OptOut;
+    let fs_pub  = nsec3_optout_fs_pub(owner, next, flags, deleg_hash, salt, fs_binding_32);
+    let trace   = build_nsec3_optout_trace(n_trace, NSEC3_OPTOUT_BIT, flags);
+
+    let t0 = Instant::now();
+    let proof = prove_one_sub_air_with_trace(
+        &trace, n_trace, BLOWUP, fs_pub, b"nsec3_optout_bound", air.num_constraints(),
+        |lde, nt, bw, cc| deep_ali_merge_general(lde, cc, air, F::from(0u64), nt, bw).0,
+        |n0, ph| nsec3_bound_params(n0, ldt, ph),
+    );
+    let prove_ms = t0.elapsed().as_secs_f64() * 1e3;
+    Nsec3DenialBoundProof { n_trace, prove_ms, proof }
+}
+
+/// Verify a witness-binding Opt-Out elision proof.  Returns `true` only if
+/// the committed Flags-octet trace genuinely satisfies the `Nsec3OptOut`
+/// constraints (Opt-Out bit set) under the public inputs.
+pub fn verify_nsec3_optout_bound(
+    bp:            &Nsec3DenialBoundProof,
+    owner:         &[u8; 32],
+    next:          &[u8; 32],
+    flags:         u8,
+    deleg_hash:    &[u8; 32],
+    salt:          &[u8; 16],
+    fs_binding_32: &[u8; 32],
+    ldt:           LdtMode,
+) -> bool {
+    if !nsec3_covers(owner, next, deleg_hash) { return false; }
+    let air    = AirType::Nsec3OptOut;
+    let fs_pub = nsec3_optout_fs_pub(owner, next, flags, deleg_hash, salt, fs_binding_32);
+    verify_one_sub_air_with_trace(
+        &bp.proof, bp.n_trace, BLOWUP, fs_pub, b"nsec3_optout_bound",
+        air.width(), air.num_constraints(),
+        |cur, nxt, row| evaluate_constraints(air, cur, nxt, row),
+        |n0, ph| nsec3_bound_params(n0, ldt, ph),
+    ).is_ok()
+}
+
+/// Witness-binding variant of [`prove_nsec3_wildcard_closure`] (reuses the N2
+/// `Nsec3NoData` non-coverage AIR over the wildcard record's type bitmap).
+pub fn prove_nsec3_wildcard_closure_bound(
+    ce_hash:       &[u8; 32],
+    wildcard:      &Nsec3TypedRecord,
+    qname_hash:    &[u8; 32],
+    qtype:         u16,
+    salt:          &[u8; 16],
+    fs_binding_32: &[u8; 32],
+    ldt:           LdtMode,
+) -> Nsec3DenialBoundProof {
+    assert!(qtype < 256, "qtype {qtype} outside NSEC3 window 0 (0..255)");
+    assert!(!nsec3_type_present(&wildcard.type_bitmap, qtype as u8),
+        "wildcard covers type {qtype} — it WOULD synthesise; closure fails");
+
+    let n_trace = 256usize;
+    let air     = AirType::Nsec3NoData;
+    let fs_pub  = nsec3_wildcard_fs_pub(ce_hash, wildcard, qname_hash, qtype, salt, fs_binding_32);
+    let trace   = build_nsec3_nodata_trace(n_trace, qtype, &wildcard.type_bitmap);
+
+    let t0 = Instant::now();
+    let proof = prove_one_sub_air_with_trace(
+        &trace, n_trace, BLOWUP, fs_pub, b"nsec3_wildcard_bound", air.num_constraints(),
+        |lde, nt, bw, cc| deep_ali_merge_general(lde, cc, air, F::from(0u64), nt, bw).0,
+        |n0, ph| nsec3_bound_params(n0, ldt, ph),
+    );
+    let prove_ms = t0.elapsed().as_secs_f64() * 1e3;
+    Nsec3DenialBoundProof { n_trace, prove_ms, proof }
+}
+
+/// Verify a witness-binding wildcard-closure proof.  Returns `true` only if
+/// the committed bitmap trace genuinely satisfies `Nsec3NoData` (queried type
+/// absent from the wildcard) under the public inputs.
+pub fn verify_nsec3_wildcard_closure_bound(
+    bp:                     &Nsec3DenialBoundProof,
+    ce_hash:                &[u8; 32],
+    wildcard:               &Nsec3TypedRecord,
+    expected_wildcard_hash: &[u8; 32],
+    qname_hash:             &[u8; 32],
+    qtype:                  u16,
+    salt:                   &[u8; 16],
+    fs_binding_32:          &[u8; 32],
+    ldt:                    LdtMode,
+) -> bool {
+    if qtype >= 256 || &wildcard.owner_hash != expected_wildcard_hash { return false; }
+    let air    = AirType::Nsec3NoData;
+    let fs_pub = nsec3_wildcard_fs_pub(ce_hash, wildcard, qname_hash, qtype, salt, fs_binding_32);
+    verify_one_sub_air_with_trace(
+        &bp.proof, bp.n_trace, BLOWUP, fs_pub, b"nsec3_wildcard_bound",
+        air.width(), air.num_constraints(),
+        |cur, nxt, row| evaluate_constraints(air, cur, nxt, row),
+        |n0, ph| nsec3_bound_params(n0, ldt, ph),
+    ).is_ok()
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 //  In-circuit lexicographic cover  (F1 gadget)
 // ─────────────────────────────────────────────────────────────────────────────
 //
@@ -4406,5 +4605,160 @@ mod lex_cover_tests {
         // owner < next (normal) but q outside (q > next).
         let owner = h(0x10, 0); let next = h(0x40, 0); let q = h(0x90, 0);
         let _ = prove_nsec3_cover(&owner, &q, &next, &FS, LdtMode::Stir);
+    }
+}
+
+#[cfg(test)]
+mod nsec3_bound_tests {
+    use super::*;
+
+    const SALT: [u8; 16] = [0x5A; 16];
+    const FSB:  [u8; 32] = [0xC3; 32];
+
+    /// Set window-0 type bit `t` (MSB-first within byte `t>>3`, RFC 4034 §4.1.2).
+    fn set_type_bit(bm: &mut [u8; 32], t: u16) { bm[(t >> 3) as usize] |= 0x80u8 >> (t & 7); }
+
+    #[test]
+    #[ignore = "prove path hits ark-ff 0.4.2 debug-assert; run --release --ignored"]
+    fn nodata_bound_honest_accept_and_cross_reject() {
+        let qtype = 28u16; // AAAA
+        let mut bm = [0u8; 32];
+        set_type_bit(&mut bm, 1); // A present, AAAA absent
+        let owner = [0x11u8; 32];
+        let rec = Nsec3TypedRecord { owner_hash: owner, next_hash: [0x22; 32], type_bitmap: bm };
+        let ldt = LdtMode::Fri;
+
+        let bp = prove_nsec3_nodata_bound(&rec, &owner, qtype, &SALT, &FSB, ldt);
+        assert!(verify_nsec3_nodata_bound(&bp, &rec, &owner, qtype, &SALT, &FSB, ldt),
+            "honest NODATA must verify");
+
+        // Cross-statement: same proof, different record (different owner) → reject.
+        let other_owner = [0x33u8; 32];
+        let other = Nsec3TypedRecord { owner_hash: other_owner, next_hash: [0x44; 32], type_bitmap: bm };
+        assert!(!verify_nsec3_nodata_bound(&bp, &other, &other_owner, qtype, &SALT, &FSB, ldt),
+            "NODATA proof must not verify under a different record's public inputs");
+    }
+
+    #[test]
+    #[ignore = "prove path hits ark-ff 0.4.2 debug-assert; run --release --ignored"]
+    fn nodata_bound_tampered_witness_rejects() {
+        // Constraint-violating witness: a NODATA trace whose queried type is
+        // actually PRESENT.  Routed through the SAME binding primitive — the
+        // verifier's per-query constraint re-check must reject it.
+        let qtype = 28u16;
+        let mut bm = [0u8; 32];
+        set_type_bit(&mut bm, qtype); // qtype PRESENT → violates "absent"
+        let n_trace = 256usize;
+        let air = AirType::Nsec3NoData;
+        let trace = build_nsec3_nodata_trace(n_trace, qtype, &bm);
+        let fs_pub = [0x99u8; 32];
+        let ldt = LdtMode::Fri;
+
+        let proof = prove_one_sub_air_with_trace(
+            &trace, n_trace, BLOWUP, fs_pub, b"nsec3_nodata_bound", air.num_constraints(),
+            |lde, nt, bw, cc| deep_ali_merge_general(lde, cc, air, F::from(0u64), nt, bw).0,
+            |n0, ph| nsec3_bound_params(n0, ldt, ph),
+        );
+        let ok = verify_one_sub_air_with_trace(
+            &proof, n_trace, BLOWUP, fs_pub, b"nsec3_nodata_bound",
+            air.width(), air.num_constraints(),
+            |cur, nxt, row| evaluate_constraints(air, cur, nxt, row),
+            |n0, ph| nsec3_bound_params(n0, ldt, ph),
+        ).is_ok();
+        assert!(!ok, "tampered NODATA (queried type PRESENT) must be rejected by witness-binding");
+    }
+
+    #[test]
+    #[ignore = "prove path hits ark-ff 0.4.2 debug-assert; run --release --ignored"]
+    fn optout_bound_honest_accept_and_tamper_reject() {
+        let owner = [0x10u8; 32];
+        let next  = [0x90u8; 32];
+        let deleg = [0x50u8; 32]; // owner < deleg < next
+        let flags_set = 1u8 << NSEC3_OPTOUT_BIT; // Opt-Out set
+        let ldt = LdtMode::Fri;
+
+        let bp = prove_nsec3_optout_bound(&owner, &next, flags_set, &deleg, &SALT, &FSB, ldt);
+        assert!(verify_nsec3_optout_bound(&bp, &owner, &next, flags_set, &deleg, &SALT, &FSB, ldt),
+            "honest Opt-Out must verify");
+
+        // Tamper: a Flags-octet trace with the Opt-Out bit CLEAR violates the AIR.
+        let n_trace = 256usize;
+        let air = AirType::Nsec3OptOut;
+        let trace = build_nsec3_optout_trace(n_trace, NSEC3_OPTOUT_BIT, 0x00); // Opt-Out clear
+        let fs_pub = [0x77u8; 32];
+        let proof = prove_one_sub_air_with_trace(
+            &trace, n_trace, BLOWUP, fs_pub, b"nsec3_optout_bound", air.num_constraints(),
+            |lde, nt, bw, cc| deep_ali_merge_general(lde, cc, air, F::from(0u64), nt, bw).0,
+            |n0, ph| nsec3_bound_params(n0, ldt, ph),
+        );
+        let ok = verify_one_sub_air_with_trace(
+            &proof, n_trace, BLOWUP, fs_pub, b"nsec3_optout_bound",
+            air.width(), air.num_constraints(),
+            |cur, nxt, row| evaluate_constraints(air, cur, nxt, row),
+            |n0, ph| nsec3_bound_params(n0, ldt, ph),
+        ).is_ok();
+        assert!(!ok, "Opt-Out trace with the flag CLEAR must be rejected by witness-binding");
+    }
+
+    #[test]
+    #[ignore = "prove path hits ark-ff 0.4.2 debug-assert; run --release --ignored"]
+    fn wildcard_bound_honest_accept() {
+        let qtype = 28u16;
+        let mut bm = [0u8; 32];
+        set_type_bit(&mut bm, 1);
+        let wc_owner = [0xABu8; 32];
+        let wc = Nsec3TypedRecord { owner_hash: wc_owner, next_hash: [0xCD; 32], type_bitmap: bm };
+        let ce = [0xEEu8; 32];
+        let qn = [0xFFu8; 32];
+        let ldt = LdtMode::Fri;
+        let bp = prove_nsec3_wildcard_closure_bound(&ce, &wc, &qn, qtype, &SALT, &FSB, ldt);
+        assert!(verify_nsec3_wildcard_closure_bound(&bp, &ce, &wc, &wc_owner, &qn, qtype, &SALT, &FSB, ldt),
+            "honest wildcard closure must verify");
+    }
+}
+
+#[cfg(test)]
+mod nsec3_bound_measure {
+    use super::*;
+    use std::time::Instant;
+
+    const SALT: [u8; 16] = [0x5A; 16];
+    const FSB:  [u8; 32] = [0xC3; 32];
+    fn set_type_bit(bm: &mut [u8; 32], t: u16) { bm[(t >> 3) as usize] |= 0x80u8 >> (t & 7); }
+
+    #[test]
+    #[ignore = "measurement; run --release --ignored --nocapture"]
+    fn nsec3_bound_sizes_l1() {
+        let ldt = LdtMode::Fri;
+        // NODATA
+        let qtype = 28u16; let mut bm = [0u8; 32]; set_type_bit(&mut bm, 1);
+        let owner = [0x11u8; 32];
+        let rec = Nsec3TypedRecord { owner_hash: owner, next_hash: [0x22; 32], type_bitmap: bm };
+        let nd = prove_nsec3_nodata_bound(&rec, &owner, qtype, &SALT, &FSB, ldt);
+        let t = Instant::now();
+        let _ = verify_nsec3_nodata_bound(&nd, &rec, &owner, qtype, &SALT, &FSB, ldt);
+        let nd_v = t.elapsed().as_secs_f64() * 1e3;
+        let nd_sz = deep_ali::sub_air_with_trace::serialize_proof(&nd.proof).len();
+
+        // OPTOUT
+        let oo = prove_nsec3_optout_bound(&[0x10;32], &[0x90;32], 1u8 << NSEC3_OPTOUT_BIT, &[0x50;32], &SALT, &FSB, ldt);
+        let t = Instant::now();
+        let _ = verify_nsec3_optout_bound(&oo, &[0x10;32], &[0x90;32], 1u8 << NSEC3_OPTOUT_BIT, &[0x50;32], &SALT, &FSB, ldt);
+        let oo_v = t.elapsed().as_secs_f64() * 1e3;
+        let oo_sz = deep_ali::sub_air_with_trace::serialize_proof(&oo.proof).len();
+
+        // WILDCARD
+        let wc = Nsec3TypedRecord { owner_hash: [0xAB;32], next_hash: [0xCD;32], type_bitmap: bm };
+        let wd = prove_nsec3_wildcard_closure_bound(&[0xEE;32], &wc, &[0xFF;32], qtype, &SALT, &FSB, ldt);
+        let t = Instant::now();
+        let _ = verify_nsec3_wildcard_closure_bound(&wd, &[0xEE;32], &wc, &[0xAB;32], &[0xFF;32], qtype, &SALT, &FSB, ldt);
+        let wd_v = t.elapsed().as_secs_f64() * 1e3;
+        let wd_sz = deep_ali::sub_air_with_trace::serialize_proof(&wd.proof).len();
+
+        let kib = |b: usize| b as f64 / 1024.0;
+        println!("\n=== NSEC3 witness-binding denial-of-existence (M4, L1, sha3-256, blowup={BLOWUP}, r={NUM_QUERIES}) ===");
+        println!("NODATA   (n_trace={}): prove {:.1} ms, verify {:.2} ms, π {:.1} KiB", nd.n_trace, nd.prove_ms, nd_v, kib(nd_sz));
+        println!("OPTOUT   (n_trace={}): prove {:.1} ms, verify {:.2} ms, π {:.1} KiB", oo.n_trace, oo.prove_ms, oo_v, kib(oo_sz));
+        println!("WILDCARD (n_trace={}): prove {:.1} ms, verify {:.2} ms, π {:.1} KiB", wd.n_trace, wd.prove_ms, wd_v, kib(wd_sz));
     }
 }
