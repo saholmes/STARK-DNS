@@ -78,6 +78,23 @@ impl EpochRecord {
             rdata:       self.rdata.clone(),
         }
     }
+
+    /// Freshness verdict for this record's RRSIG validity window at wall-clock
+    /// `now` (Unix seconds): `Expired` if `now > sig_expiration`,
+    /// `NotYetValid` if `now < sig_inception`, else `Fresh`. The
+    /// inception/expiration are RRSIG RDATA fields covered by the signature
+    /// the NI proof verifies in-circuit, so a verifier may check freshness
+    /// against its own clock without trusting the producer. Records with no
+    /// stamped window (legacy packages) return `Fresh` (policy decides).
+    pub fn freshness(&self, now: u32) -> RrsigFreshness {
+        if let Some(inc) = self.sig_inception {
+            if now < inc { return RrsigFreshness::NotYetValid { inception: inc, now }; }
+        }
+        if let Some(exp) = self.sig_expiration {
+            if now > exp { return RrsigFreshness::Expired { expiration: exp, now }; }
+        }
+        RrsigFreshness::Fresh
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -269,13 +286,7 @@ impl SeEpochPackage {
         -> RrsigFreshness
     {
         let _ = self;
-        if let Some(inc) = record.sig_inception {
-            if now < inc { return RrsigFreshness::NotYetValid { inception: inc, now }; }
-        }
-        if let Some(exp) = record.sig_expiration {
-            if now > exp { return RrsigFreshness::Expired { expiration: exp, now }; }
-        }
-        RrsigFreshness::Fresh
+        record.freshness(now)
     }
 
     /// Total serialised size in bytes (sum of all variable components +
@@ -372,4 +383,74 @@ pub fn resolve<'a>(
         leaf_index: idx,
         merkle_path: path,
     })
+}
+
+#[cfg(test)]
+mod freshness_tests {
+    use super::*;
+
+    /// A sample DNSSEC-signed record: www.example.com. A (93.184.216.34),
+    /// ECDSA-P256-SHA256 (alg 13), with a typical ~21-day RRSIG validity
+    /// window. Inception 2026-06-01, expiration 2026-06-22 (Unix seconds).
+    fn sample_record() -> EpochRecord {
+        EpochRecord {
+            domain:        "www.example.com.".to_string(),
+            record_type:   1,                    // A
+            algorithm:     13,                   // ECDSAP256SHA256 (RFC 8624)
+            rdata:         vec![93, 184, 216, 34],
+            ttl:           3600,
+            sig_inception:  Some(1_780_272_000), // ~2026-06-01 00:00:00 UTC
+            sig_expiration: Some(1_782_086_400), // ~2026-06-22 00:00:00 UTC (+21d)
+        }
+    }
+
+    #[test]
+    fn sample_record_freshness_and_out_of_date() {
+        let rec = sample_record();
+        let inc = rec.sig_inception.unwrap();
+        let exp = rec.sig_expiration.unwrap();
+        let day = 86_400u32;
+
+        // (a) now inside the window -> Fresh (safe to serve / in compliance).
+        let now_fresh = inc + 10 * day;
+        assert_eq!(rec.freshness(now_fresh), RrsigFreshness::Fresh);
+
+        // (b) now before inception -> NotYetValid (future-dated replay).
+        let now_early = inc - day;
+        assert_eq!(rec.freshness(now_early),
+            RrsigFreshness::NotYetValid { inception: inc, now: now_early });
+
+        // (c) now after expiration -> Expired == OUT OF DATE (the target test).
+        let now_expired = exp + day;
+        assert_eq!(rec.freshness(now_expired),
+            RrsigFreshness::Expired { expiration: exp, now: now_expired });
+
+        // Demonstration output for the sample record.
+        for (label, now) in [("in-window", now_fresh), ("pre-inception", now_early),
+                             ("post-expiration", now_expired)] {
+            println!("[freshness] {} ({label}) @ now={now}: {:?}",
+                rec.domain, rec.freshness(now));
+        }
+    }
+
+    #[test]
+    fn boundary_inception_and_expiration_inclusive() {
+        let rec = sample_record();
+        let inc = rec.sig_inception.unwrap();
+        let exp = rec.sig_expiration.unwrap();
+        // Exactly at the bounds is still valid (now >= inc, now <= exp).
+        assert_eq!(rec.freshness(inc), RrsigFreshness::Fresh, "inception instant is valid");
+        assert_eq!(rec.freshness(exp), RrsigFreshness::Fresh, "expiration instant is valid");
+        // One second past expiration is out of date.
+        assert!(matches!(rec.freshness(exp + 1), RrsigFreshness::Expired { .. }),
+            "one second past expiration must be Expired");
+    }
+
+    #[test]
+    fn unstamped_record_is_fresh_by_policy() {
+        let mut rec = sample_record();
+        rec.sig_inception = None;
+        rec.sig_expiration = None;
+        assert_eq!(rec.freshness(0), RrsigFreshness::Fresh);
+    }
 }
