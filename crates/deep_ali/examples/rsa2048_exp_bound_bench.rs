@@ -23,14 +23,27 @@ use num_bigint::BigUint;
 use rand::{Rng, SeedableRng};
 
 use deep_ali::{
-    deep_ali_merge_rsa_exp_streaming,
+    deep_ali_merge_per_row_no_layout,
     fri::DeepFriParams,
     rsa2048_exp_air::{
         build_rsa_exp_multirow_layout, eval_rsa_exp_multirow_per_row,
         fill_rsa_exp_multirow, rsa_exp_multirow_constraints, RsaExpMultirowLayout,
     },
+    rsa2048_field_air::{biguint_to_limbs80, RSA_NUM_LIMBS},
     sub_air_with_trace::{prove_one_sub_air_with_trace, verify_one_sub_air_with_trace},
 };
+
+/// Public-input PIN targets: the 80-limb encodings of the modulus, signature,
+/// and encoded message, pinned to the trace's `n_base`/`s_base`/`em_base`
+/// input columns so the proof binds the committed trace to the PUBLIC
+/// `(n, s, em)` — not an arbitrary `(s', n', em')` with `s'^e ≡ em' (mod n')`
+/// that the prover chose.  Without these, the AIR proves only an internally
+/// consistent exponentiation; the pins bind it to the verifier's public key
+/// and signature.
+fn rsa_public_pin_targets(n: &BigUint, s: &BigUint, em: &BigUint) -> (Vec<F>, Vec<F>, Vec<F>) {
+    let f = |limbs: [i64; RSA_NUM_LIMBS]| limbs.iter().map(|&v| F::from(v as u64)).collect::<Vec<F>>();
+    (f(biguint_to_limbs80(n)), f(biguint_to_limbs80(s)), f(biguint_to_limbs80(em)))
+}
 
 fn gen_biguint(rng: &mut rand::rngs::StdRng, bits: u32) -> BigUint {
     let bytes = (bits as usize + 7) / 8;
@@ -61,14 +74,26 @@ fn prove_then_verify(
     layout: &RsaExpMultirowLayout, width: usize, n: &BigUint, s: &BigUint, em: &BigUint,
     n_trace: usize, blowup: usize, r: usize, use_stir: bool,
 ) -> (f64, f64, f64, f64, usize, bool) {
-    let kk = rsa_exp_multirow_constraints(layout);
+    let kk_base = rsa_exp_multirow_constraints(layout);
+    let kk = kk_base + 3 * RSA_NUM_LIMBS; // + public-input pins (n, s, em)
+    let (want_n, want_s, want_em) = rsa_public_pin_targets(n, s, em);
+    // Per-row eval = RSA exp constraints ++ pins binding the n/s/em input
+    // columns to the PUBLIC values.  Shared verbatim by prover and verifier.
+    let eval = |cur: &[F], nxt: &[F], row: usize| -> Vec<F> {
+        let mut c = eval_rsa_exp_multirow_per_row(cur, nxt, row, n_trace, layout);
+        for i in 0..RSA_NUM_LIMBS { c.push(cur[layout.n_base + i]  - want_n[i]); }
+        for i in 0..RSA_NUM_LIMBS { c.push(cur[layout.s_base + i]  - want_s[i]); }
+        for i in 0..RSA_NUM_LIMBS { c.push(cur[layout.em_base + i] - want_em[i]); }
+        c
+    };
     let mut trace: Vec<Vec<F>> = (0..width).map(|_| vec![F::zero(); n_trace]).collect();
     fill_rsa_exp_multirow(&mut trace, layout, n_trace, n, s, em);
 
     let t0 = Instant::now();
     let proof = prove_one_sub_air_with_trace(
         &trace, n_trace, blowup, PI_HASH, b"rsa_exp_bound", kk,
-        |lde, nt, bw, cc| deep_ali_merge_rsa_exp_streaming(lde, cc, layout, F::zero(), nt, bw).0,
+        |lde, nt, bw, cc| deep_ali_merge_per_row_no_layout(
+            lde, cc, F::zero(), nt, bw, width, kk, &eval).0,
         |n0, ph| mk_params(n0, r, use_stir, ph),
     );
     let prove_ms = t0.elapsed().as_secs_f64() * 1000.0;
@@ -76,7 +101,7 @@ fn prove_then_verify(
     let t0 = Instant::now();
     let res = verify_one_sub_air_with_trace(
         &proof, n_trace, blowup, PI_HASH, b"rsa_exp_bound", width, kk,
-        |cur, nxt, row| eval_rsa_exp_multirow_per_row(cur, nxt, row, n_trace, layout),
+        &eval,
         |n0, ph| mk_params(n0, r, use_stir, ph),
     );
     let verify_ms = t0.elapsed().as_secs_f64() * 1000.0;
@@ -120,6 +145,41 @@ fn main() {
     let (_, _, _, _, _, bad_ok) =
         prove_then_verify(&layout, width, &n, &s, &bogus_em, n_trace, blowup, r, use_stir);
     eprintln!("[tampered] em=s^65537+1 -> verify={bad_ok}");
+
+    // ── Cross-signature: A's proof must NOT verify under B's public inputs ──
+    //    (the public-input pins close signature substitution).
+    let s2 = gen_biguint_below(&mut rng, &n);
+    let em2 = s2.modpow(&BigUint::from(65_537u32), &n);
+    let kk = rsa_exp_multirow_constraints(&layout) + 3 * RSA_NUM_LIMBS;
+    let (an, as_, aem) = rsa_public_pin_targets(&n, &s, &em);
+    let (bn, bs, bem) = rsa_public_pin_targets(&n, &s2, &em2);
+    let eval_a = |cur: &[F], nxt: &[F], row: usize| -> Vec<F> {
+        let mut c = eval_rsa_exp_multirow_per_row(cur, nxt, row, n_trace, &layout);
+        for i in 0..RSA_NUM_LIMBS { c.push(cur[layout.n_base + i]  - an[i]); }
+        for i in 0..RSA_NUM_LIMBS { c.push(cur[layout.s_base + i]  - as_[i]); }
+        for i in 0..RSA_NUM_LIMBS { c.push(cur[layout.em_base + i] - aem[i]); }
+        c
+    };
+    let eval_b = |cur: &[F], nxt: &[F], row: usize| -> Vec<F> {
+        let mut c = eval_rsa_exp_multirow_per_row(cur, nxt, row, n_trace, &layout);
+        for i in 0..RSA_NUM_LIMBS { c.push(cur[layout.n_base + i]  - bn[i]); }
+        for i in 0..RSA_NUM_LIMBS { c.push(cur[layout.s_base + i]  - bs[i]); }
+        for i in 0..RSA_NUM_LIMBS { c.push(cur[layout.em_base + i] - bem[i]); }
+        c
+    };
+    let mut trace_a: Vec<Vec<F>> = (0..width).map(|_| vec![F::zero(); n_trace]).collect();
+    fill_rsa_exp_multirow(&mut trace_a, &layout, n_trace, &n, &s, &em);
+    let proof_a = prove_one_sub_air_with_trace(
+        &trace_a, n_trace, blowup, PI_HASH, b"rsa_exp_bound", kk,
+        |lde, nt, bw, cc| deep_ali_merge_per_row_no_layout(lde, cc, F::zero(), nt, bw, width, kk, &eval_a).0,
+        |n0, ph| mk_params(n0, r, use_stir, ph),
+    );
+    let cross = verify_one_sub_air_with_trace(
+        &proof_a, n_trace, blowup, PI_HASH, b"rsa_exp_bound", width, kk,
+        &eval_b, |n0, ph| mk_params(n0, r, use_stir, ph),
+    ).is_ok();
+    eprintln!("[cross]    A's proof under B's public (s,em) -> verify={cross}");
+    assert!(!cross, "PIN BROKEN: A's proof verified under a different public signature");
 
     println!("rsa2048_exp_bound level=L{level} field=Fp{ext_deg} n_trace={n_trace} blowup={blowup} \
               r={r} prove_ms={p_ms:.1} verify_ms={v_ms:.2} fri_kib={fri_kib:.1} proof_mib={full_mib:.2} \
