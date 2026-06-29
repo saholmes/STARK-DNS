@@ -612,10 +612,24 @@ pub fn deep_ali_merge_sha256(
     // ── Step 1: evaluate constraints on the LDE domain ──
     let mut constraint_evals = vec![vec![F::zero(); n]; SHA_K];
     for i in 0..n {
+        // Gate the final trace row's contribution to zero, matching the
+        // verifier's `trace_row >= n_trace-1` skip in
+        // `sub_air_with_trace::verify_one_sub_air_with_trace`.  The wrap
+        // transition row (n_trace-1 → 0) is not a real AIR transition
+        // (the SHA-256 digest-state row does not equal the IV row), so its
+        // constraint residual is intentionally unenforced.  Without this
+        // gate the merge bakes a nonzero residual at the last H-row into
+        // phi, phi fails to vanish on H, `poly_div_zh` drops a remainder,
+        // and the witness-binding identity `c_eval·Z_H = phi` then fails at
+        // OTHER (off-H) query points.  (The bare low-degree path never
+        // re-evaluated constraints off-H, so it was unaffected.)
+        let trace_row = i / blowup;
+        if trace_row == n_trace - 1 {
+            continue;
+        }
         let cur: Vec<F> = (0..SHA_W).map(|c| trace_evals_on_lde[c][i]).collect();
         let nxt_idx = (i + blowup) % n;
         let nxt: Vec<F> = (0..SHA_W).map(|c| trace_evals_on_lde[c][nxt_idx]).collect();
-        let trace_row = i / blowup;
         let cvals = crate::sha256_air::eval_sha256_constraints(
             &cur, &nxt, trace_row, n_blocks,
         );

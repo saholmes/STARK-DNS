@@ -1735,6 +1735,115 @@ pub fn prove_ds_ksk_binding(
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+//  Witness-binding DS→KSK (SHA-256) prover
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// Sound counterpart to `prove_ds_ksk_binding`.  The DS→KSK digest is a
+// *transition* AIR over a multi-block SHA-256 trace with row-dependent round
+// constants K[t]; it is not an `AirType`, so it uses the SHA-256-specific
+// merge `deep_ali_merge_sha256` and per-row evaluator `eval_sha256_constraints`
+// rather than the generic `deep_ali_merge_general`/`evaluate_constraints` (a
+// prior generic-merge attempt honest-failed precisely because SHA-256 has no
+// `AirType` case).  Routed through `prove_one_sub_air_with_trace`: the trace
+// LDE is Merkle-committed (root → FS public input) and the verifier re-checks
+// `c_eval(x)·Z_H(x) = Σ α_j Φ_j(trace[x], x)` at every authenticated FRI query
+// opening — using the SAME `trace_row = pos/blowup` and `nxt = pos+blowup`
+// conventions as the merge, so the row-dependent round constants reconstruct
+// consistently.  A trace that violates a SHA-256 round (a tampered working
+// state, a wrong schedule word) is therefore rejected in-circuit.
+//
+// The FS public input binds the public statement (DNSKEY RDATA, the parent's
+// DS digest, the asserted SHA-256 digest, and the FS tag), so a proof for one
+// (dnskey, ds) is rejected under another's.  Pinning the message *bytes* and
+// digest *cells* to those public values via in-circuit boundary constraints
+// (as done for the ECDSA verifier) is the documented follow-on; this delivers
+// the trace-binding half (the audit's missing S_ic ingredient).
+
+/// Witness-binding DS→KSK proof (the full `SubAirProofWithTrace`).
+pub struct DsKskBoundProof {
+    pub asserted_digest: [u8; 32],
+    pub n_blocks:        usize,
+    pub n_trace:         usize,
+    pub prove_ms:        f64,
+    pub proof:           SubAirProofWithTrace,
+}
+
+/// FS public input for the bound DS→KSK proof: binds the DNSKEY RDATA, the
+/// parent DS digest, the asserted SHA-256 digest, and the FS tag.  (No
+/// `root_f0` term — `prove_one_sub_air_with_trace` folds the trace root into
+/// the Fiat–Shamir input itself.)
+fn ds_ksk_bound_pi_hash(
+    dnskey_bytes:    &[u8],
+    parent_ds_hash:  &[u8; 32],
+    asserted_digest: &[u8; 32],
+    fs_binding_32:   &[u8; 32],
+) -> [u8; 32] {
+    let mut h = sha3::Sha3_256::new();
+    Digest::update(&mut h, b"DNS-DS-KSK-BOUND-PIHASH-V1");
+    Digest::update(&mut h, &(dnskey_bytes.len() as u64).to_le_bytes());
+    Digest::update(&mut h, dnskey_bytes);
+    Digest::update(&mut h, parent_ds_hash);
+    Digest::update(&mut h, asserted_digest);
+    Digest::update(&mut h, fs_binding_32);
+    Digest::finalize(h).into()
+}
+
+/// Witness-binding variant of [`prove_ds_ksk_binding`].
+pub fn prove_ds_ksk_binding_bound(
+    dnskey_bytes:   &[u8],
+    parent_ds_hash: &[u8; 32],
+    fs_binding_32:  &[u8; 32],
+    ldt:            LdtMode,
+) -> DsKskBoundProof {
+    use ark_ff::PrimeField;
+    let (trace, n_blocks) = sha256_air::build_sha256_trace_multi(dnskey_bytes);
+    let n_trace = trace[0].len();
+    assert!(n_trace.is_power_of_two(), "trace height must be power of 2");
+    assert_eq!(trace.len(), sha256_air::WIDTH);
+
+    let digest_row = sha256_air::ROWS_PER_BLOCK * (n_blocks - 1) + 65;
+    let mut asserted_digest = [0u8; 32];
+    for k in 0..8 {
+        let f = trace[sha256_air::OFF_H0 + k][digest_row];
+        let word = <F as PrimeField>::into_bigint(f).0[0] as u32;
+        asserted_digest[4*k..4*(k+1)].copy_from_slice(&word.to_be_bytes());
+    }
+
+    let pi_hash = ds_ksk_bound_pi_hash(dnskey_bytes, parent_ds_hash, &asserted_digest, fs_binding_32);
+
+    let t0 = Instant::now();
+    let proof = prove_one_sub_air_with_trace(
+        &trace, n_trace, BLOWUP, pi_hash, b"ds_ksk_bound", sha256_air::NUM_CONSTRAINTS,
+        |lde, nt, bw, cc| deep_ali_merge_sha256(lde, cc, F::from(0u64), nt, bw, n_blocks).0,
+        |n0, ph| nsec3_bound_params(n0, ldt, ph),
+    );
+    let prove_ms = t0.elapsed().as_secs_f64() * 1e3;
+    DsKskBoundProof { asserted_digest, n_blocks, n_trace, prove_ms, proof }
+}
+
+/// Verify a witness-binding DS→KSK proof.  Returns `true` only if (a) the
+/// asserted SHA-256 digest equals the parent's DS digest, and (b) the
+/// committed trace genuinely satisfies the SHA-256 AIR constraints (re-checked
+/// at the authenticated query openings) under the public inputs.
+pub fn verify_ds_ksk_binding_bound(
+    bp:             &DsKskBoundProof,
+    dnskey_bytes:   &[u8],
+    parent_ds_hash: &[u8; 32],
+    fs_binding_32:  &[u8; 32],
+    ldt:            LdtMode,
+) -> bool {
+    if &bp.asserted_digest != parent_ds_hash { return false; }
+    let pi_hash = ds_ksk_bound_pi_hash(dnskey_bytes, parent_ds_hash, &bp.asserted_digest, fs_binding_32);
+    let n_blocks = bp.n_blocks;
+    verify_one_sub_air_with_trace(
+        &bp.proof, bp.n_trace, BLOWUP, pi_hash, b"ds_ksk_bound",
+        sha256_air::WIDTH, sha256_air::NUM_CONSTRAINTS,
+        |cur, nxt, row| sha256_air::eval_sha256_constraints(cur, nxt, row, n_blocks),
+        |n0, ph| nsec3_bound_params(n0, ldt, ph),
+    ).is_ok()
+}
+
 // ═══════════════════════════════════════════════════════════════════
 //  ZSK→KSK BINDING — Ed25519 (RFC 8080 + RFC 8032)
 // ═══════════════════════════════════════════════════════════════════
@@ -4760,5 +4869,87 @@ mod nsec3_bound_measure {
         println!("NODATA   (n_trace={}): prove {:.1} ms, verify {:.2} ms, π {:.1} KiB", nd.n_trace, nd.prove_ms, nd_v, kib(nd_sz));
         println!("OPTOUT   (n_trace={}): prove {:.1} ms, verify {:.2} ms, π {:.1} KiB", oo.n_trace, oo.prove_ms, oo_v, kib(oo_sz));
         println!("WILDCARD (n_trace={}): prove {:.1} ms, verify {:.2} ms, π {:.1} KiB", wd.n_trace, wd.prove_ms, wd_v, kib(wd_sz));
+        let dnskey: &[u8] = b"\x01\x00\x03\x0dSAMPLE-KSK-PUBLIC-KEY-MATERIAL-256-bit";
+        let ds = { use sha2::{Digest as _, Sha256}; let mut h=Sha256::new(); h.update(dnskey); let o: [u8;32]=h.finalize().into(); o };
+        let dk = prove_ds_ksk_binding_bound(dnskey, &ds, &FSB, ldt);
+        let t = Instant::now(); let _ = verify_ds_ksk_binding_bound(&dk, dnskey, &ds, &FSB, ldt); let dk_v = t.elapsed().as_secs_f64()*1e3;
+        let dk_sz = deep_ali::sub_air_with_trace::serialize_proof(&dk.proof).len();
+        println!("DS-KSK   (n_trace={} blocks={}): prove {:.1} ms, verify {:.2} ms, pi {:.1} KiB", dk.n_trace, dk.n_blocks, dk.prove_ms, dk_v, kib(dk_sz));
     }
 }
+
+#[cfg(test)]
+mod ds_ksk_bound_tests {
+    use super::*;
+
+    const FSB: [u8; 32] = [0xD5; 32];
+
+    fn sha256(msg: &[u8]) -> [u8; 32] {
+        use sha2::{Digest as _, Sha256};
+        let mut h = Sha256::new(); h.update(msg); h.finalize().into()
+    }
+
+    #[test]
+    #[ignore = "prove path hits ark-ff 0.4.2 debug-assert; run --release --ignored"]
+    fn ds_ksk_bound_honest_accept_and_cross_reject() {
+        // A small canonical DNSKEY RDATA (flags|proto|alg|key).  The DS digest
+        // (RFC 4034 §5.1.4, type 2 = SHA-256) is SHA-256 over owner||RDATA; we
+        // hash the RDATA blob directly here — the AIR proves SHA-256(message).
+        let dnskey: &[u8] = b"\x01\x00\x03\x0dSAMPLE-KSK-PUBLIC-KEY-MATERIAL-THAT-IS-DELIBERATELY-OVER-64-BYTES-TO-FORCE-TWO-SHA256-BLOCKS-XYZ";
+        let ds = sha256(dnskey);
+        let ldt = LdtMode::Fri;
+
+        let bp = prove_ds_ksk_binding_bound(dnskey, &ds, &FSB, ldt);
+        assert_eq!(&bp.asserted_digest, &ds, "AIR digest must equal independent SHA-256");
+        assert!(verify_ds_ksk_binding_bound(&bp, dnskey, &ds, &FSB, ldt),
+            "honest DS→KSK must verify");
+
+        // Wrong parent DS digest → reject (the DS-match native check).
+        let mut wrong = ds; wrong[0] ^= 0xff;
+        assert!(!verify_ds_ksk_binding_bound(&bp, dnskey, &wrong, &FSB, ldt),
+            "DS→KSK must reject a mismatched parent DS digest");
+
+        // Different DNSKEY (same proof) → different FS public input → reject.
+        let other: &[u8] = b"\x01\x00\x03\x0dDIFFERENT-KSK-PUBLIC-KEY-MATERIAL-2048";
+        assert!(!verify_ds_ksk_binding_bound(&bp, other, &ds, &FSB, ldt),
+            "DS→KSK proof must not verify under a different DNSKEY's public inputs");
+    }
+
+    #[test]
+    #[ignore = "prove path hits ark-ff 0.4.2 debug-assert; run --release --ignored"]
+    fn ds_ksk_bound_tampered_trace_rejects() {
+        // Build an honest trace, flip an H-state cell at an interior
+        // compression row (breaks the SHA-256 H-state propagation), and route
+        // the tampered trace through the SAME binding primitive — the
+        // verifier's per-query constraint re-check must reject it.
+        use ark_ff::PrimeField;
+        let dnskey: &[u8] = b"\x01\x00\x03\x0dSAMPLE-KSK-PUBLIC-KEY-MATERIAL-256-bit";
+        let (mut trace, n_blocks) = sha256_air::build_sha256_trace_multi(dnskey);
+        let n_trace = trace[0].len();
+        trace[sha256_air::OFF_H0][10] += F::from(1u64); // tamper interior row
+
+        let mut digest = [0u8; 32];
+        let digest_row = sha256_air::ROWS_PER_BLOCK * (n_blocks - 1) + 65;
+        for k in 0..8 {
+            let word = <F as PrimeField>::into_bigint(trace[sha256_air::OFF_H0 + k][digest_row]).0[0] as u32;
+            digest[4*k..4*(k+1)].copy_from_slice(&word.to_be_bytes());
+        }
+        let ldt = LdtMode::Fri;
+        let pi_hash = ds_ksk_bound_pi_hash(dnskey, &digest, &digest, &FSB);
+
+        let proof = prove_one_sub_air_with_trace(
+            &trace, n_trace, BLOWUP, pi_hash, b"ds_ksk_bound", sha256_air::NUM_CONSTRAINTS,
+            |lde, nt, bw, cc| deep_ali_merge_sha256(lde, cc, F::from(0u64), nt, bw, n_blocks).0,
+            |n0, ph| nsec3_bound_params(n0, ldt, ph),
+        );
+        let ok = verify_one_sub_air_with_trace(
+            &proof, n_trace, BLOWUP, pi_hash, b"ds_ksk_bound",
+            sha256_air::WIDTH, sha256_air::NUM_CONSTRAINTS,
+            |cur, nxt, row| sha256_air::eval_sha256_constraints(cur, nxt, row, n_blocks),
+            |n0, ph| nsec3_bound_params(n0, ldt, ph),
+        ).is_ok();
+        assert!(!ok, "tampered SHA-256 trace must be rejected by witness-binding");
+    }
+}
+
+
