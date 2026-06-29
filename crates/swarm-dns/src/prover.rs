@@ -2003,6 +2003,40 @@ fn ds_ksk_bound_pi_hash(
 }
 
 /// Witness-binding variant of [`prove_ds_ksk_binding`].
+/// Digest-pin count for the bound DS→KSK AIR (8 SHA-256 H-state words).
+const DS_KSK_DIGEST_PINS: usize = 8;
+
+/// The parent DS digest as the AIR's 8 big-endian 32-bit H-state words.
+fn ds_digest_words(parent_ds: &[u8; 32]) -> [F; 8] {
+    let mut w = [F::from(0u64); 8];
+    for k in 0..8 {
+        let word = u32::from_be_bytes(
+            [parent_ds[4*k], parent_ds[4*k+1], parent_ds[4*k+2], parent_ds[4*k+3]]);
+        w[k] = F::from(word as u64);
+    }
+    w
+}
+
+/// Per-row eval for the bound DS→KSK AIR: the SHA-256 constraints followed by
+/// 8 DIGEST PINS that fire at `digest_row`, binding the post-finalisation
+/// H-state words to the PUBLIC parent DS digest.  This is load-bearing: the
+/// reported `asserted_digest` is prover-supplied and otherwise decoupled from
+/// the trace, so without the pins a prover could compute SHA-256 of any
+/// message yet claim the digest equals the parent DS.  Pinning the H-state to
+/// `parent_ds` forces the committed trace to actually compute `parent_ds`,
+/// in-circuit.  Shared verbatim by prover and verifier.
+#[inline]
+fn ds_ksk_pinned_eval(
+    cur: &[F], nxt: &[F], row: usize, n_blocks: usize, digest_row: usize, ds_words: &[F; 8],
+) -> Vec<F> {
+    let mut c = sha256_air::eval_sha256_constraints(cur, nxt, row, n_blocks);
+    let fire = row == digest_row;
+    for k in 0..8 {
+        c.push(if fire { cur[sha256_air::OFF_H0 + k] - ds_words[k] } else { F::from(0u64) });
+    }
+    c
+}
+
 pub fn prove_ds_ksk_binding_bound(
     dnskey_bytes:   &[u8],
     parent_ds_hash: &[u8; 32],
@@ -2023,12 +2057,18 @@ pub fn prove_ds_ksk_binding_bound(
         asserted_digest[4*k..4*(k+1)].copy_from_slice(&word.to_be_bytes());
     }
 
-    let pi_hash = ds_ksk_bound_pi_hash(dnskey_bytes, parent_ds_hash, &asserted_digest, fs_binding_32);
+    let width    = sha256_air::WIDTH;
+    let n_cons   = sha256_air::NUM_CONSTRAINTS + DS_KSK_DIGEST_PINS;
+    let ds_words = ds_digest_words(parent_ds_hash);
+    let pi_hash  = ds_ksk_bound_pi_hash(dnskey_bytes, parent_ds_hash, &asserted_digest, fs_binding_32);
 
     let t0 = Instant::now();
     let proof = prove_one_sub_air_with_trace(
-        &trace, n_trace, BLOWUP, pi_hash, b"ds_ksk_bound", sha256_air::NUM_CONSTRAINTS,
-        |lde, nt, bw, cc| deep_ali_merge_sha256(lde, cc, F::from(0u64), nt, bw, n_blocks).0,
+        &trace, n_trace, BLOWUP, pi_hash, b"ds_ksk_bound", n_cons,
+        |lde, nt, bw, cc| deep_ali::deep_ali_merge_per_row_no_layout(
+            lde, cc, F::from(0u64), nt, bw, width, n_cons,
+            |cur, nxt, row| ds_ksk_pinned_eval(cur, nxt, row, n_blocks, digest_row, &ds_words),
+        ).0,
         |n0, ph| nsec3_bound_params(n0, ldt, ph),
     );
     let prove_ms = t0.elapsed().as_secs_f64() * 1e3;
@@ -2037,8 +2077,10 @@ pub fn prove_ds_ksk_binding_bound(
 
 /// Verify a witness-binding DS→KSK proof.  Returns `true` only if (a) the
 /// asserted SHA-256 digest equals the parent's DS digest, and (b) the
-/// committed trace genuinely satisfies the SHA-256 AIR constraints (re-checked
-/// at the authenticated query openings) under the public inputs.
+/// committed trace satisfies the SHA-256 AIR AND its post-finalisation H-state
+/// equals `parent_ds_hash` (the digest pins, re-checked at the query
+/// openings) — so the trace genuinely computes the parent DS digest, not an
+/// arbitrary hash with a prover-asserted label.
 pub fn verify_ds_ksk_binding_bound(
     bp:             &DsKskBoundProof,
     dnskey_bytes:   &[u8],
@@ -2047,12 +2089,16 @@ pub fn verify_ds_ksk_binding_bound(
     ldt:            LdtMode,
 ) -> bool {
     if &bp.asserted_digest != parent_ds_hash { return false; }
-    let pi_hash = ds_ksk_bound_pi_hash(dnskey_bytes, parent_ds_hash, &bp.asserted_digest, fs_binding_32);
-    let n_blocks = bp.n_blocks;
+    let pi_hash    = ds_ksk_bound_pi_hash(dnskey_bytes, parent_ds_hash, &bp.asserted_digest, fs_binding_32);
+    let n_blocks   = bp.n_blocks;
+    let digest_row = sha256_air::ROWS_PER_BLOCK * (n_blocks - 1) + 65;
+    let width      = sha256_air::WIDTH;
+    let n_cons     = sha256_air::NUM_CONSTRAINTS + DS_KSK_DIGEST_PINS;
+    let ds_words   = ds_digest_words(parent_ds_hash);
     verify_one_sub_air_with_trace(
         &bp.proof, bp.n_trace, BLOWUP, pi_hash, b"ds_ksk_bound",
-        sha256_air::WIDTH, sha256_air::NUM_CONSTRAINTS,
-        |cur, nxt, row| sha256_air::eval_sha256_constraints(cur, nxt, row, n_blocks),
+        width, n_cons,
+        |cur, nxt, row| ds_ksk_pinned_eval(cur, nxt, row, n_blocks, digest_row, &ds_words),
         |n0, ph| nsec3_bound_params(n0, ldt, ph),
     ).is_ok()
 }
@@ -5195,6 +5241,38 @@ mod ds_ksk_bound_tests {
             |n0, ph| nsec3_bound_params(n0, ldt, ph),
         ).is_ok();
         assert!(!ok, "tampered SHA-256 trace must be rejected by witness-binding");
+    }
+
+    #[test]
+    #[ignore = "prove path hits ark-ff 0.4.2 debug-assert; run --release --ignored"]
+    fn ds_digest_pin_rejects_wrong_target() {
+        // The forgery the digest pins close: a trace that honestly computes
+        // D = SHA-256(dnskey), but the digest is pinned to a WRONG target
+        // T != D (as if claiming the DNSKEY hashes to some other parent DS).
+        // The pins (trace H-state vs T) must reject.
+        let dnskey: &[u8] = b"\x01\x00\x03\x0dSAMPLE-KSK-PUBLIC-KEY-MATERIAL-256-bit";
+        let d = sha256(dnskey);
+        let mut t_wrong = d; t_wrong[0] ^= 0xff;     // T != D
+        let ldt = LdtMode::Fri;
+        let (trace, n_blocks) = sha256_air::build_sha256_trace_multi(dnskey);
+        let n_trace = trace[0].len();
+        let digest_row = sha256_air::ROWS_PER_BLOCK * (n_blocks - 1) + 65;
+        let width = sha256_air::WIDTH;
+        let n_cons = sha256_air::NUM_CONSTRAINTS + DS_KSK_DIGEST_PINS;
+        let ds_words = ds_digest_words(&t_wrong);     // pin to the WRONG target
+        let pi_hash = ds_ksk_bound_pi_hash(dnskey, &t_wrong, &d, &FSB);
+        let proof = prove_one_sub_air_with_trace(
+            &trace, n_trace, BLOWUP, pi_hash, b"ds_ksk_bound", n_cons,
+            |lde, nt, bw, cc| deep_ali::deep_ali_merge_per_row_no_layout(
+                lde, cc, F::from(0u64), nt, bw, width, n_cons,
+                |cur, nxt, row| ds_ksk_pinned_eval(cur, nxt, row, n_blocks, digest_row, &ds_words)).0,
+            |n0, ph| nsec3_bound_params(n0, ldt, ph),
+        );
+        let ok = verify_one_sub_air_with_trace(
+            &proof, n_trace, BLOWUP, pi_hash, b"ds_ksk_bound", width, n_cons,
+            |cur, nxt, row| ds_ksk_pinned_eval(cur, nxt, row, n_blocks, digest_row, &ds_words),
+            |n0, ph| nsec3_bound_params(n0, ldt, ph)).is_ok();
+        assert!(!ok, "digest pin must reject when the trace's H-state != the pinned parent DS");
     }
 }
 
