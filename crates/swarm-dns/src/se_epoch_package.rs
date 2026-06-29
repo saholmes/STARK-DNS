@@ -454,3 +454,47 @@ mod freshness_tests {
         assert_eq!(rec.freshness(0), RrsigFreshness::Fresh);
     }
 }
+
+#[cfg(test)]
+mod se_data_stats {
+    use super::*;
+    use std::path::PathBuf;
+
+    /// Empirical freshness/coverage statistics over the captured real .se
+    /// epoch package (Tranco top-1M filtered to .se; 857 records).
+    #[test]
+    #[ignore = "reads scripts/data/se-epoch-package-tranco.bin; run --ignored --nocapture"]
+    fn se_zone_validity_window_and_freshness() {
+        let p = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../scripts/data/se-epoch-package-tranco.bin");
+        let pkg = match load_from_file(&p) { Ok(x) => x, Err(e) => { println!("[.se] load failed ({e}); skipping"); return; } };
+        let n = pkg.records.len();
+        let day = 86_400f64;
+        let mut dur: Vec<i64> = Vec::new();
+        let mut algos = std::collections::BTreeMap::<u8, usize>::new();
+        let (mut with_win, mut no_win) = (0usize, 0usize);
+        for r in &pkg.records {
+            *algos.entry(r.algorithm).or_default() += 1;
+            match (r.sig_inception, r.sig_expiration) {
+                (Some(i), Some(e)) => { with_win += 1; dur.push(e as i64 - i as i64); }
+                (None, None) => no_win += 1,
+                _ => {}
+            }
+        }
+        dur.sort_unstable();
+        let stat = |v: &[i64], q: f64| if v.is_empty() {0.0} else { v[((v.len() as f64 - 1.0)*q) as usize] as f64/day };
+        let cap = pkg.epoch_t as u32;
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as u32;
+        let expired = |t: u32| pkg.records.iter().filter(|r| matches!(r.freshness(t), RrsigFreshness::Expired{..})).count();
+        let fresh   = |t: u32| pkg.records.iter().filter(|r| matches!(r.freshness(t), RrsigFreshness::Fresh)).count();
+
+        println!("\n=== Real .se epoch package: DNSSEC + freshness data ===");
+        println!("[.se] records={n}  with-validity-window={with_win}  no-window={no_win}");
+        println!("[.se] RRSIG validity window (days): min={:.1} p25={:.1} median={:.1} p75={:.1} max={:.1}",
+            stat(&dur,0.0), stat(&dur,0.25), stat(&dur,0.5), stat(&dur,0.75), stat(&dur,1.0));
+        println!("[.se] DNSSEC algorithm histogram (alg->count): {:?}", algos);
+        println!("[.se] at capture  t={cap}: fresh={} expired={}", fresh(cap), expired(cap));
+        println!("[.se] at now      t={now}: fresh={} expired={}  <- records expired since capture",
+            fresh(now), expired(now));
+    }
+}
