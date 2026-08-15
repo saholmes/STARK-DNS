@@ -64,9 +64,11 @@ fn build_trace(n: usize, tamper: bool) -> Vec<Vec<F>> {
 }
 
 fn params(n0: usize, pi_hash: [u8; 32]) -> DeepFriParams {
+    // NIST L1 UNCONDITIONAL (Johnson): binary (arity-2) folding, r=128 queries at rho=1/4 (blowup 4)
+    // gives 128*1 bit = 128-bit Johnson soundness (delta=1-sqrt(1/4)=1/2 -> 1 bit/query). No conjecture.
     DeepFriParams {
         schedule: vec![2usize; n0.trailing_zeros() as usize],
-        r: 16,
+        r: 128,
         seed_z: 0xDEEF_BAAD,
         coeff_commit_final: true,
         d_final: 1,
