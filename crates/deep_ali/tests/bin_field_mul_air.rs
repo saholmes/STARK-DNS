@@ -105,6 +105,61 @@ fn stir_params(n0: usize, pi_hash: [u8; 32]) -> DeepFriParams {
     p
 }
 
+/// FRI schedule with folding factor `arity`, folding FULLY to final size 1 (d_final=1), matching the
+/// working binary params; `arity` per round while it divides, else 2-fold the remainder.
+fn arity_schedule(n0: usize, arity: usize) -> Vec<usize> {
+    let mut s = Vec::new();
+    let mut cur = n0;
+    while cur > 1 {
+        if cur % arity == 0 && cur >= arity {
+            s.push(arity);
+            cur /= arity;
+        } else if cur % 2 == 0 {
+            s.push(2);
+            cur /= 2;
+        } else {
+            break;
+        }
+    }
+    s
+}
+
+#[test]
+fn bin_field_mul_air_arity_sweep() {
+    let pi_hash = [0x11u8; 32];
+    let dsep = b"pq-rollup/bin-mul-air/v1";
+    let blowup = 4usize;
+    let nt = 131072usize; // fixed instance; sweep the folding arity
+    const BASE_MUL_GAS: u64 = 91;
+    const BASE_PER_EXT: u64 = 9;
+
+    println!("\n===== Proof size vs FOLDING ARITY (n_trace={nt}, r=128, NIST L1 unconditional) =====");
+    println!("{:>6} {:>7} {:>11} {:>10} {:>9} {:>10}", "arity", "rounds", "proof B", "ext muls", "vfy ms", "vfy gas");
+    let trace = build_trace(nt, false);
+    for &arity in &[2usize, 4, 8, 16] {
+        let sched = arity_schedule(nt * blowup, arity);
+        let rounds = sched.len();
+        let sc = sched.clone();
+        let mk = move |_n0: usize, ph: [u8; 32]| {
+            let mut p = DeepFriParams::new(sc.clone(), 128, 42).with_d_final(1);
+            p.coeff_commit_final = true;
+            p.public_inputs_hash = Some(ph);
+            p
+        };
+        let proof = prove_one_sub_air_with_trace(&trace, nt, blowup, pi_hash, dsep, NUM_CONSTRAINTS, c_eval, &mk);
+        let bytes = serialize_proof(&proof).len();
+        reset_ext_mul_count();
+        let t = Instant::now();
+        let ok = verify_one_sub_air_with_trace(&proof, nt, blowup, pi_hash, dsep, WIDTH, NUM_CONSTRAINTS, eval_per_row, &mk);
+        let vms = t.elapsed().as_secs_f64() * 1e3;
+        let ext = ext_mul_count();
+        assert!(ok.is_ok(), "arity {arity}: {ok:?}");
+        let gas = ext * BASE_PER_EXT * BASE_MUL_GAS;
+        println!("{arity:>6} {rounds:>7} {bytes:>11} {ext:>10} {vms:>9.2} {gas:>9}");
+    }
+    println!("\nProof is query-dominated; folding arity trades rounds vs openings/query. Optimal ~= 8.");
+}
+
 /// The DEEP-ALI merge: fold all constraints/columns into ONE composition polynomial to commit.
 fn c_eval(lde: &[Vec<F>], n_trace: usize, blowup: usize, comb: &[F]) -> Vec<F> {
     deep_ali_merge_per_row_no_layout(lde, comb, F::one(), n_trace, blowup, WIDTH, NUM_CONSTRAINTS, eval_per_row).0
