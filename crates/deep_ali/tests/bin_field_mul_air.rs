@@ -20,6 +20,7 @@ use std::time::Instant;
 use ark_ff::{Field, One, Zero};
 use ark_goldilocks::Goldilocks as F;
 
+use deep_ali::cubic_ext::{ext_mul_count, reset_ext_mul_count};
 use deep_ali::deep_ali_merge_per_row_no_layout;
 use deep_ali::fri::DeepFriParams;
 use deep_ali::sub_air_with_trace::{
@@ -86,22 +87,56 @@ fn bin_field_mul_air_end_to_end() {
     let dsep = b"pq-rollup/bin-mul-air/v1";
     let blowup = 4usize;
 
+    // Measured on-chain gas anchors (programs/evm-gas): base Goldilocks mul = native MULMOD (91 gas,
+    // loop-inclusive); a cubic-ext (Ext) mul = 9 base muls (schoolbook) ~= 819 gas.
+    const BASE_MUL_GAS: u64 = 91;
+    const BASE_PER_EXT: u64 = 9;
+    let gwei = 15.0f64;
+    let eth = 3500.0f64;
+
     println!("\n===== Binary-field multiply AIR over deep_ali (Goldilocks; DEEP-ALI merge -> 1 poly) =====");
     println!("width={WIDTH}, constraints={NUM_CONSTRAINTS} (degree 2). One GF(2^128) mul ~= 2^15 rows.");
-    println!("{:>8} {:>10} {:>10} {:>12}", "n_trace", "prove ms", "verify ms", "proof bytes");
+    println!("On-chain: base Goldilocks mul = {BASE_MUL_GAS} gas (MULMOD), Ext mul = {BASE_PER_EXT} base.");
+    println!("{:>8} {:>9} {:>9} {:>10} {:>10} {:>11} {:>9}", "n_trace", "prove ms", "vfy ms", "proof B", "Ext muls", "verify gas", "$/verify");
 
+    let mut samples: Vec<(f64, f64)> = Vec::new(); // (log2 n_trace, Ext muls) for extrapolation
     for &nt in &[4096usize, 16384, 32768] {
-        // Honest trace: prove + verify.
         let trace = build_trace(nt, false);
         let t0 = Instant::now();
         let proof = prove_one_sub_air_with_trace(&trace, nt, blowup, pi_hash, dsep, NUM_CONSTRAINTS, c_eval, params);
         let prove_ms = t0.elapsed().as_secs_f64() * 1e3;
         let bytes = serialize_proof(&proof).len();
+
+        reset_ext_mul_count();
         let t1 = Instant::now();
         let ok = verify_one_sub_air_with_trace(&proof, nt, blowup, pi_hash, dsep, WIDTH, NUM_CONSTRAINTS, eval_per_row, params);
         let verify_ms = t1.elapsed().as_secs_f64() * 1e3;
+        let ext_muls = ext_mul_count();
         assert!(ok.is_ok(), "honest AIR must verify at n_trace={nt}: {ok:?}");
-        println!("{nt:>8} {prove_ms:>10.1} {verify_ms:>10.2} {bytes:>12}");
+
+        let verify_gas = ext_muls * BASE_PER_EXT * BASE_MUL_GAS;
+        let usd = verify_gas as f64 * gwei * 1e-9 * eth;
+        println!("{nt:>8} {prove_ms:>9.1} {verify_ms:>9.2} {bytes:>10} {ext_muls:>10} {verify_gas:>9} gas ${usd:>7.2}");
+        samples.push(((nt as f64).log2(), ext_muls as f64));
+    }
+
+    // Extrapolate Ext-mul count to the recursion-shrunk inner-verify size (58 B256 muls ~= 7.6M rows
+    // ~= 2^23). STARK verify muls grow ~linearly in log2(n) (queries x fold rounds), so fit a line.
+    let m = samples.len() as f64;
+    let (sx, sy) = (samples.iter().map(|p| p.0).sum::<f64>(), samples.iter().map(|p| p.1).sum::<f64>());
+    let sxx = samples.iter().map(|p| p.0 * p.0).sum::<f64>();
+    let sxy = samples.iter().map(|p| p.0 * p.1).sum::<f64>();
+    let slope = (m * sxy - sx * sy) / (m * sxx - sx * sx);
+    let intercept = (sy - slope * sx) / m;
+    for &log2n in &[23.0f64] {
+        let ext = (slope * log2n + intercept).max(0.0);
+        let gas = (ext * BASE_PER_EXT as f64 * BASE_MUL_GAS as f64) as u64;
+        let usd = gas as f64 * gwei * 1e-9 * eth;
+        println!(
+            "\nExtrapolated OUTER verify @ 2^{:.0} rows (~7.6M, the recursion-shrunk inner verify): {:.0} Ext muls",
+            log2n, ext
+        );
+        println!("  -> field-op verify gas ~= {gas} gas (${usd:.2} @15gwei); binary equiv was 754M gas.");
     }
 
     // SOUNDNESS: a trace that breaks a constraint must NOT verify.

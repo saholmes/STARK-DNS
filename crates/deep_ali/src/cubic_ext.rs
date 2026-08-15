@@ -18,6 +18,19 @@ use crate::tower_field::TowerField;
 
 use ark_ff::{Zero, One};
 
+/// Count of cubic-extension (Ext) multiplies, each = 9 base Goldilocks multiplies (schoolbook).
+/// Instrumentation for sizing the on-chain gas of a prime-field outer STARK verify: reset before a
+/// measured verify, read after. Not on the correctness path.
+pub static EXT_MUL_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Reset the Ext-multiply counter.
+pub fn reset_ext_mul_count() {
+    EXT_MUL_COUNT.store(0, std::sync::atomic::Ordering::Relaxed);
+}
+/// Read the Ext-multiply counter.
+pub fn ext_mul_count() -> u64 {
+    EXT_MUL_COUNT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 impl<C: CubeExtConfig> Zero for CubeExt<C> {
     fn zero() -> Self {
         Self {
@@ -164,6 +177,7 @@ impl<C: CubeExtConfig> CubeExt<C> {
     //   c2 = a0·b2 + a1·b1 + a2·b0
     #[inline]
     fn mul_impl(&self, rhs: &Self) -> Self {
+        EXT_MUL_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let (a0, a1, a2) = (self.c[0], self.c[1], self.c[2]);
         let (b0, b1, b2) = (rhs.c[0],  rhs.c[1],  rhs.c[2]);
 
