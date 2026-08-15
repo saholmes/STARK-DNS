@@ -129,7 +129,7 @@ fn bin_field_mul_air_end_to_end() {
     println!("{:>8} {:>9} {:>9} {:>10} {:>10} {:>11} {:>9}", "n_trace", "prove ms", "vfy ms", "proof B", "Ext muls", "verify gas", "$/verify");
 
     let mut samples: Vec<(f64, f64)> = Vec::new(); // (log2 n_trace, Ext muls) for extrapolation
-    for &nt in &[4096usize, 16384, 32768] {
+    for &nt in &[64usize, 256, 1024, 4096, 32768, 131072] {
         let trace = build_trace(nt, false);
         let t0 = Instant::now();
         let proof = prove_one_sub_air_with_trace(&trace, nt, blowup, pi_hash, dsep, NUM_CONSTRAINTS, c_eval, params);
