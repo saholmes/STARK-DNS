@@ -78,6 +78,33 @@ fn params(n0: usize, pi_hash: [u8; 32]) -> DeepFriParams {
     }
 }
 
+/// STIR folding schedule with NON-BINARY folding factor 16 (= 2^4): STIR folds by 2^x per round with
+/// no soundness loss, so log2(n0) binary rounds collapse to ~log16(n0) rounds -- the source of STIR's
+/// smaller proof and cheaper verify. Returns (schedule, final_size).
+fn stir_schedule(n0: usize) -> (Vec<usize>, usize) {
+    let mut sched = Vec::new();
+    let mut cur = n0;
+    while cur % 16 == 0 && cur / 16 >= 2 {
+        sched.push(16);
+        cur /= 16;
+    }
+    while cur % 2 == 0 && cur / 2 >= 2 {
+        sched.push(2);
+        cur /= 2;
+    }
+    (sched, cur)
+}
+
+/// NIST L1 UNCONDITIONAL STIR: r=54 queries at rho=1/32 (blowup 32), Johnson bound (2.5 bits/query,
+/// unconditional). Non-binary (16-ary) folding => few rounds => smaller proof + cheaper verify.
+fn stir_params(n0: usize, pi_hash: [u8; 32]) -> DeepFriParams {
+    let (schedule, final_size) = stir_schedule(n0);
+    let d_final = (final_size / 2).max(1);
+    let mut p = DeepFriParams::new(schedule, 0, 42).with_stir().with_s0(54).with_d_final(d_final);
+    p.public_inputs_hash = Some(pi_hash);
+    p
+}
+
 /// The DEEP-ALI merge: fold all constraints/columns into ONE composition polynomial to commit.
 fn c_eval(lde: &[Vec<F>], n_trace: usize, blowup: usize, comb: &[F]) -> Vec<F> {
     deep_ali_merge_per_row_no_layout(lde, comb, F::one(), n_trace, blowup, WIDTH, NUM_CONSTRAINTS, eval_per_row).0
@@ -151,4 +178,71 @@ fn bin_field_mul_air_end_to_end() {
     println!("composition polynomial (single commitment -> single-random-oracle QROM security).");
     println!("Extrapolate: one GF(2^128) mul ~= a 2^15-row instance; the recursion-shrunk 58-B256-mul");
     println!("inner verify ~= 58*4 = 232 such 2^15 instances (~7.6M rows), proved once off-chain.");
+}
+
+use ark_poly::univariate::DensePolynomial;
+use ark_poly::{DenseUVPolynomial, EvaluationDomain, GeneralEvaluationDomain};
+use deep_ali::cubic_ext::{CubeExt, GoldilocksCubeConfig};
+use deep_ali::fri::{deep_fri_proof_size_bytes, deep_fri_prove, deep_fri_verify, FriDomain};
+
+type E = CubeExt<GoldilocksCubeConfig>;
+
+/// STIR (non-binary 16-ary folding) vs FRI (binary) on the same low-degree test (the outer proof's
+/// FRI layer), same rate rho=1/32 and same r=54 queries (NIST L1 unconditional Johnson). STIR folds
+/// by 16 per round -> log16(n) rounds vs FRI's log2(n) -> smaller proof + fewer verify Ext muls.
+#[test]
+fn stir_vs_fri_outer_proof() {
+    use rand::{rngs::StdRng, SeedableRng};
+    let mut rng = StdRng::seed_from_u64(1234);
+    const BASE_MUL_GAS: u64 = 91;
+    const BASE_PER_EXT: u64 = 9;
+
+    println!("\n===== STIR (16-ary folding) vs FRI (binary) on the outer proof, r=54 rho=1/32 (NIST L1) =====");
+    println!("{:>7} {:>6} {:>7} {:>7} | {:>10} {:>10} {:>7} | {:>10} {:>10} {:>7}",
+        "log2 n", "rounds", "FRI B", "STIR B", "FRIextmul", "STIRextmul", "mul x", "FRI gas", "STIR gas", "gas x");
+
+    for &logn in &[14usize, 16, 18] {
+        let n = 1usize << logn;
+        let degree = n / 32 - 1; // rho = 1/32
+        let dom = GeneralEvaluationDomain::<F>::new(n).unwrap();
+        let poly = DensePolynomial::<F>::rand(degree, &mut rng);
+        let evals: Vec<F> = dom.fft(&poly.coeffs);
+        let domain0 = FriDomain::new_radix2(n);
+
+        // Fold both to final_size = 16 (d_final = 8). FRI: binary (logn-4 rounds). STIR: 16-ary.
+        let fri_sched = vec![2usize; logn - 4];
+        let mut stir_sched = Vec::new();
+        let mut cur = n;
+        while cur % 16 == 0 && cur / 16 >= 16 {
+            stir_sched.push(16);
+            cur /= 16;
+        }
+        while cur / 2 >= 16 {
+            stir_sched.push(2);
+            cur /= 2;
+        }
+        let d_final = (cur / 2).max(1);
+
+        let fri_p = DeepFriParams::new(fri_sched, 54, 42).with_d_final(8);
+        let stir_p = DeepFriParams::new(stir_sched.clone(), 0, 42).with_stir().with_s0(54).with_d_final(d_final);
+
+        let fri_proof = deep_fri_prove::<E>(evals.clone(), domain0, &fri_p);
+        let stir_proof = deep_fri_prove::<E>(evals.clone(), domain0, &stir_p);
+        let fri_b = deep_fri_proof_size_bytes(&fri_proof, false);
+        let stir_b = deep_fri_proof_size_bytes(&stir_proof, true);
+
+        reset_ext_mul_count();
+        assert!(deep_fri_verify(&fri_p, &fri_proof), "FRI verify @ 2^{logn}");
+        let fri_ext = ext_mul_count();
+        reset_ext_mul_count();
+        assert!(deep_fri_verify(&stir_p, &stir_proof), "STIR verify @ 2^{logn}");
+        let stir_ext = ext_mul_count();
+
+        let fri_gas = fri_ext * BASE_PER_EXT * BASE_MUL_GAS + fri_b as u64 * 16;
+        let stir_gas = stir_ext * BASE_PER_EXT * BASE_MUL_GAS + stir_b as u64 * 16;
+        println!("{logn:>7} {:>6} {fri_b:>7} {stir_b:>7} | {fri_ext:>10} {stir_ext:>10} {:>6.1}x | {fri_gas:>8} g {stir_gas:>8} g {:>5.1}x",
+            stir_sched.len(), fri_ext as f64 / stir_ext.max(1) as f64, fri_gas as f64 / stir_gas.max(1) as f64);
+    }
+    println!("\nSTIR's non-binary (16-ary) folding cuts rounds (log16 vs log2), shrinking BOTH the proof");
+    println!("(calldata/chunking bottleneck) AND the verify Ext-mul count -- unconditionally (Johnson).");
 }
