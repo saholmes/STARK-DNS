@@ -1243,6 +1243,203 @@ pub fn deep_ali_merge_per_row_no_layout(
     (c_eval, info)
 }
 
+/// GLOBAL (ungated) coset composition merge — the hiding (ZK) path.
+///
+/// Unlike [`deep_ali_merge_per_row_no_layout`], this applies NO per-row gating and takes a constraint
+/// evaluator with NO `row` argument: `eval_global(cur, nxt)` must be a genuine GLOBAL polynomial relation
+/// that holds on EVERY row (including the cyclic wrap `row n-1 -> row 0`). Boundary/row-specific logic is
+/// therefore not expressible here — the caller must encode its statement as a global cyclic constraint
+/// (e.g. a cyclic accumulator `ACC(ω·X) - ACC(X) - W(X) = 0`, whose telescoping sum forces `Σ W = 0`).
+///
+/// Because the composition is a global polynomial, the interpolant recovered on the COSET
+/// `coset_offset · H_n` equals the true composition at every coset point, so a coset LDE (disjoint from
+/// the trace subgroup) hides every opened cell while the step-3e identity still holds. This is what the
+/// per-row-gated merge could NOT do on a coset (see scope §4ter). Pair with the trace LDE from
+/// [`crate::trace_import::lde_trace_columns_masked_coset`] and a global coset verifier, same `coset_offset`.
+#[allow(clippy::too_many_arguments)]
+pub fn deep_ali_merge_global_coset(
+    trace_evals_on_lde: &[Vec<F>],
+    combination_coeffs: &[F],
+    coset_offset: F,
+    n_trace: usize,
+    blowup: usize,
+    width: usize,
+    num_constraints: usize,
+    eval_global: impl Fn(&[F], &[F]) -> Vec<F> + Sync,
+) -> (Vec<F>, CompositionInfo) {
+    let n = n_trace * blowup;
+    assert_eq!(trace_evals_on_lde.len(), width);
+    assert_eq!(combination_coeffs.len(), num_constraints);
+    for col in trace_evals_on_lde { assert_eq!(col.len(), n); }
+
+    let eval_at = |i: usize| -> F {
+        let cur: Vec<F> = (0..width).map(|c| trace_evals_on_lde[c][i]).collect();
+        let nxt_idx = (i + blowup) % n;
+        let nxt: Vec<F> = (0..width).map(|c| trace_evals_on_lde[c][nxt_idx]).collect();
+        let cvals = eval_global(&cur, &nxt);
+        let mut acc = F::zero();
+        for j in 0..num_constraints { acc += combination_coeffs[j] * cvals[j]; }
+        acc
+    };
+    let phi: Vec<F> = if enable_parallel(n) {
+        #[cfg(feature = "parallel")]
+        { (0..n).into_par_iter().map(eval_at).collect() }
+        #[cfg(not(feature = "parallel"))]
+        { (0..n).map(eval_at).collect() }
+    } else {
+        (0..n).map(eval_at).collect()
+    };
+
+    let coset = ark_poly::Radix2EvaluationDomain::<F>::new(n)
+        .expect("power-of-two")
+        .get_coset(coset_offset)
+        .expect("coset");
+    let phi_coeffs = coset.ifft(&phi);
+    let c_coeffs = poly_div_zh(&phi_coeffs, n_trace);
+    let mut padded = c_coeffs.clone();
+    padded.resize(n, F::zero());
+    let c_eval = coset.fft(&padded);
+
+    let max_deg = 2usize;
+    let phi_degree_bound = max_deg * n_trace;
+    let quotient_degree_bound = if phi_degree_bound > n_trace {
+        phi_degree_bound - n_trace
+    } else { 0 };
+    let info = CompositionInfo {
+        phi_degree_bound, quotient_degree_bound,
+        rate: quotient_degree_bound as f64 / n as f64,
+        num_constraints,
+        max_constraint_degree: max_deg,
+        trace_width: width,
+    };
+    (c_eval, info)
+}
+
+/// Compute `g^r` for r in 0..n_trace, where `g` is the trace-subgroup generator (the roots of `Z_H`).
+fn trace_row_points(n_trace: usize) -> Vec<F> {
+    let g = ark_poly::Radix2EvaluationDomain::<F>::new(n_trace).expect("pow2").group_gen;
+    let mut pows = Vec::with_capacity(n_trace);
+    let mut acc = F::ONE;
+    for _ in 0..n_trace {
+        pows.push(acc);
+        acc *= g;
+    }
+    pows
+}
+
+/// Complement-vanishing multiplier for constraint `j` at point `x`:
+/// `Π_{r ∉ V_j} (x − g^r)` = `Z_H(x) / Z_{V_j}(x)`. Multiplying `C_j` by this and dividing the whole
+/// composition by `Z_H` enforces `C_j` only on its vanishing set `V_j` (the rows where it must hold),
+/// while keeping ONE `poly_div_zh` division. `in_vanishing[r]` is true iff row r ∈ V_j.
+#[inline]
+fn complement_vanishing_at(x: F, g_pows: &[F], in_vanishing: &[bool]) -> F {
+    let mut acc = F::ONE;
+    for (r, &gr) in g_pows.iter().enumerate() {
+        if !in_vanishing[r] {
+            acc *= x - gr;
+        }
+    }
+    acc
+}
+
+/// GLOBAL coset merge with PER-CONSTRAINT VANISHING DOMAINS — the "path-A" composition for AIRs whose
+/// constraints hold on different row subsets (boundary/transition), made coset-hideable.
+///
+/// `eval_global(cur, nxt)` returns the raw constraint values `C_j` (row-independent — any per-row public
+/// value such as a round constant must be carried as a trace/transparent COLUMN). `vanishing_sets[j]` is
+/// the set of rows where `C_j` must hold. The composition is
+/// `φ(X) = Σ_j cc_j · C_j(X) · (Z_H(X)/Z_{V_j}(X))`, which is divisible by `Z_H` iff every `C_j` vanishes
+/// on its `V_j`; one `poly_div_zh` then yields the quotient. Evaluated on the coset `coset_offset·H_n`
+/// (disjoint from the trace subgroup) so every opened cell is masked (hiding). Pair with
+/// `verify_one_sub_air_with_trace_vanishing_coset` (same `coset_offset`, `vanishing_sets`).
+#[allow(clippy::too_many_arguments)]
+pub fn deep_ali_merge_vanishing_coset(
+    trace_evals_on_lde: &[Vec<F>],
+    combination_coeffs: &[F],
+    coset_offset: F,
+    n_trace: usize,
+    blowup: usize,
+    width: usize,
+    num_constraints: usize,
+    vanishing_sets: &[Vec<usize>],
+    eval_global: impl Fn(&[F], &[F]) -> Vec<F> + Sync,
+) -> (Vec<F>, CompositionInfo) {
+    let n = n_trace * blowup;
+    assert_eq!(trace_evals_on_lde.len(), width);
+    assert_eq!(combination_coeffs.len(), num_constraints);
+    assert_eq!(vanishing_sets.len(), num_constraints);
+    for col in trace_evals_on_lde { assert_eq!(col.len(), n); }
+
+    let g_pows = trace_row_points(n_trace);
+    // Per-constraint boolean membership in V_j, for the complement product.
+    let in_vanishing: Vec<Vec<bool>> = vanishing_sets
+        .iter()
+        .map(|vs| {
+            let mut m = vec![false; n_trace];
+            for &r in vs {
+                assert!(r < n_trace, "vanishing row {r} out of range");
+                m[r] = true;
+            }
+            m
+        })
+        .collect();
+
+    let coset = ark_poly::Radix2EvaluationDomain::<F>::new(n)
+        .expect("power-of-two")
+        .get_coset(coset_offset)
+        .expect("coset");
+
+    let eval_at = |i: usize| -> F {
+        let x = coset.element(i);
+        let cur: Vec<F> = (0..width).map(|c| trace_evals_on_lde[c][i]).collect();
+        let nxt_idx = (i + blowup) % n;
+        let nxt: Vec<F> = (0..width).map(|c| trace_evals_on_lde[c][nxt_idx]).collect();
+        let cvals = eval_global(&cur, &nxt);
+        let mut acc = F::zero();
+        for j in 0..num_constraints {
+            let mult = complement_vanishing_at(x, &g_pows, &in_vanishing[j]);
+            acc += combination_coeffs[j] * cvals[j] * mult;
+        }
+        acc
+    };
+    let phi: Vec<F> = if enable_parallel(n) {
+        #[cfg(feature = "parallel")]
+        { (0..n).into_par_iter().map(eval_at).collect() }
+        #[cfg(not(feature = "parallel"))]
+        { (0..n).map(eval_at).collect() }
+    } else {
+        (0..n).map(eval_at).collect()
+    };
+
+    let phi_coeffs = coset.ifft(&phi);
+    let c_coeffs = poly_div_zh(&phi_coeffs, n_trace);
+    let mut padded = c_coeffs.clone();
+    padded.resize(n, F::zero());
+    let c_eval = coset.fft(&padded);
+
+    let max_deg = 2usize;
+    let phi_degree_bound = max_deg * n_trace;
+    let quotient_degree_bound = if phi_degree_bound > n_trace { phi_degree_bound - n_trace } else { 0 };
+    let info = CompositionInfo {
+        phi_degree_bound, quotient_degree_bound,
+        rate: quotient_degree_bound as f64 / n as f64,
+        num_constraints,
+        max_constraint_degree: max_deg,
+        trace_width: width,
+    };
+    (c_eval, info)
+}
+
+/// The complement-vanishing multiplier at a point, exposed for the matching verifier.
+pub fn complement_vanishing_multiplier(x: F, n_trace: usize, vanishing_rows: &[usize]) -> F {
+    let g_pows = trace_row_points(n_trace);
+    let mut in_v = vec![false; n_trace];
+    for &r in vanishing_rows {
+        in_v[r] = true;
+    }
+    complement_vanishing_at(x, &g_pows, &in_v)
+}
+
 // ═══════════════════════════════════════════════════════════════════
 //  Ed25519 verify AIR — parametric merge (Phase 6 v2 wiring)
 // ═══════════════════════════════════════════════════════════════════

@@ -280,6 +280,217 @@ pub fn lde_trace_columns(
     }).collect()
 }
 
+/// Deterministic splitmix64 PRG (no external rand dependency).
+/// Used only to draw the ZK trace-mask coefficients.
+#[inline]
+fn splitmix64(state: &mut u64) -> u64 {
+    *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    let mut z = *state;
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
+/// Zero-knowledge (hidden-trace) variant of [`lde_trace_columns`].
+///
+/// For every column index in `mask_cols`, a random low-degree multiple of the
+/// trace-domain vanishing polynomial `Z_H(X) = X^{trace_len} - 1` is added to
+/// the column's interpolant **before** the LDE:
+///
+/// ```text
+///   p_masked(X) = p(X) + r(X) * Z_H(X),   deg(r) < mask_deg
+/// ```
+///
+/// `Z_H` is zero on every trace row (the order-`trace_len` subgroup), so
+/// `p_masked` agrees with `p` on the trace and the AIR is unaffected; off the
+/// trace domain `p_masked` is randomized, so the LDE values opened by FRI reveal
+/// nothing about the hidden column beyond what the (public) constraints force.
+///
+/// Soundness for a LINEAR constraint `C` is preserved: `C(p + r*Z_H) =
+/// C(p) + r'*Z_H` is still divisible by `Z_H`, so the quotient stays
+/// low-degree. (For non-linear constraints the degree budget must account for
+/// the mask; this helper is intended for the linear conservation AIR.)
+///
+/// Hiding is statistical and governed by `mask_deg`: with `mask_deg` at least
+/// the number of FRI query openings, every opened point of a masked column is
+/// blinded by an independent uniform term. `seed` selects the mask; distinct
+/// seeds give independent masks (used by the two-witness hiding gate).
+///
+/// This is purely additive — existing callers of [`lde_trace_columns`] are
+/// unchanged (it is the `mask_cols = []` case, bit-for-bit).
+pub fn lde_trace_columns_masked(
+    columns: &[Vec<F>],
+    trace_len: usize,
+    blowup: usize,
+    mask_cols: &[usize],
+    mask_deg: usize,
+    seed: u64,
+) -> Result<Vec<Vec<F>>, String> {
+    if columns.is_empty() {
+        return Err("no columns provided".into());
+    }
+    for (i, col) in columns.iter().enumerate() {
+        if col.len() != trace_len {
+            return Err(format!("column {i}: expected {trace_len} rows, got {}", col.len()));
+        }
+    }
+    if !trace_len.is_power_of_two() {
+        return Err(format!("trace_len {trace_len} must be a power of 2"));
+    }
+    if blowup < 2 || !blowup.is_power_of_two() {
+        return Err(format!("blowup {blowup} must be a power-of-2 >= 2"));
+    }
+    for &c in mask_cols {
+        if c >= columns.len() {
+            return Err(format!("mask column {c} out of range ({} columns)", columns.len()));
+        }
+    }
+
+    let n0 = trace_len * blowup;
+    // The mask r*Z_H occupies coefficients [0, trace_len + mask_deg); it must fit
+    // in the n0-length LDE coefficient buffer or the high terms would alias.
+    let eff_mask_deg = mask_deg.min(n0.saturating_sub(trace_len));
+    let trace_dom = Domain::<F>::new(trace_len).unwrap();
+    let lde_dom = Domain::<F>::new(n0).unwrap();
+
+    columns.iter().enumerate().map(|(ci, col)| {
+        let coeffs = trace_dom.ifft(col);
+        let mut padded = coeffs;
+        padded.resize(n0, F::zero());
+        if mask_cols.contains(&ci) {
+            // Draw a per-column mask stream, domain-separated by column index.
+            let mut st = seed ^ ((ci as u64).wrapping_mul(0xD1B5_4A32_D192_ED03));
+            for i in 0..eff_mask_deg {
+                let r = F::from(splitmix64(&mut st));
+                // r * Z_H = r * (X^{trace_len} - 1):  +r at X^{trace_len+i}, -r at X^i.
+                padded[i] -= r;
+                padded[trace_len + i] += r;
+            }
+        }
+        Ok(lde_dom.fft(&padded))
+    }).collect()
+}
+
+/// Coset variant of [`lde_trace_columns_masked`] — evaluates the masked interpolants on the COSET
+/// `coset_offset * H_{n0}` instead of the subgroup `H_{n0}`. With `coset_offset` a multiplicative
+/// generator the coset is disjoint from the trace subgroup, so no committed/opened LDE point is ever a
+/// trace row and `Z_H` never vanishes on it. Pair with a GLOBAL (ungated) coset merge + coset verify
+/// using the same `coset_offset`: hiding only holds when the composition is a genuine global polynomial
+/// (see `docs/goldilocks-confidential-amounts-scope.md` §4ter — a per-row-GATED composition breaks on a
+/// coset because the gating no longer controls the interpolant on the trace subgroup).
+#[allow(clippy::too_many_arguments)]
+pub fn lde_trace_columns_masked_coset(
+    columns: &[Vec<F>],
+    trace_len: usize,
+    blowup: usize,
+    mask_cols: &[usize],
+    mask_deg: usize,
+    seed: u64,
+    coset_offset: F,
+) -> Result<Vec<Vec<F>>, String> {
+    if columns.is_empty() {
+        return Err("no columns provided".into());
+    }
+    for (i, col) in columns.iter().enumerate() {
+        if col.len() != trace_len {
+            return Err(format!("column {i}: expected {trace_len} rows, got {}", col.len()));
+        }
+    }
+    if !trace_len.is_power_of_two() {
+        return Err(format!("trace_len {trace_len} must be a power of 2"));
+    }
+    if blowup < 2 || !blowup.is_power_of_two() {
+        return Err(format!("blowup {blowup} must be a power-of-2 >= 2"));
+    }
+    for &c in mask_cols {
+        if c >= columns.len() {
+            return Err(format!("mask column {c} out of range ({} columns)", columns.len()));
+        }
+    }
+
+    let n0 = trace_len * blowup;
+    let eff_mask_deg = mask_deg.min(n0.saturating_sub(trace_len));
+    let trace_dom = Domain::<F>::new(trace_len).unwrap();
+    let lde_coset = Domain::<F>::new(n0)
+        .unwrap()
+        .get_coset(coset_offset)
+        .ok_or("could not form LDE coset")?;
+
+    columns.iter().enumerate().map(|(ci, col)| {
+        let coeffs = trace_dom.ifft(col);
+        let mut padded = coeffs;
+        padded.resize(n0, F::zero());
+        if mask_cols.contains(&ci) {
+            let mut st = seed ^ ((ci as u64).wrapping_mul(0xD1B5_4A32_D192_ED03));
+            for i in 0..eff_mask_deg {
+                let r = F::from(splitmix64(&mut st));
+                padded[i] -= r;
+                padded[trace_len + i] += r;
+            }
+        }
+        Ok(lde_coset.fft(&padded))
+    }).collect()
+}
+
+#[cfg(test)]
+mod zk_mask_tests {
+    use super::*;
+    use ark_ff::Field;
+
+    #[test]
+    fn masked_lde_vanishes_on_trace_rows_and_matches_default_when_unmasked() {
+        let trace_len = 8usize;
+        let blowup = 4usize;
+        let col0: Vec<F> = (0..trace_len).map(|i| F::from((100 + i) as u64)).collect();
+        let col1: Vec<F> = (0..trace_len).map(|i| F::from((7 * i + 3) as u64)).collect();
+        let columns = vec![col0.clone(), col1.clone()];
+
+        let plain = lde_trace_columns(&columns, trace_len, blowup).unwrap();
+        let masked = lde_trace_columns_masked(&columns, trace_len, blowup, &[0], 6, 0xABCD_1234).unwrap();
+
+        for k in 0..trace_len {
+            assert_eq!(masked[0][k * blowup], col0[k], "masked col0 altered trace row {k}");
+        }
+        let mut differs = false;
+        for j in 0..(trace_len * blowup) {
+            if j % blowup != 0 && masked[0][j] != plain[0][j] {
+                differs = true;
+                break;
+            }
+        }
+        assert!(differs, "mask had no off-domain effect (not hiding)");
+        assert_eq!(masked[1], plain[1], "unmasked column diverged from default LDE");
+    }
+
+    #[test]
+    fn distinct_seeds_give_distinct_masks_same_trace() {
+        let trace_len = 8usize;
+        let blowup = 4usize;
+        let columns = vec![(0..trace_len).map(|i| F::from((42 + i) as u64)).collect::<Vec<F>>()];
+
+        let a = lde_trace_columns_masked(&columns, trace_len, blowup, &[0], 6, 1).unwrap();
+        let b = lde_trace_columns_masked(&columns, trace_len, blowup, &[0], 6, 2).unwrap();
+
+        for k in 0..trace_len {
+            assert_eq!(a[0][k * blowup], b[0][k * blowup]);
+        }
+        assert_ne!(a[0], b[0], "distinct seeds produced identical masked LDE");
+    }
+
+    #[test]
+    fn empty_mask_is_identity() {
+        let trace_len = 16usize;
+        let blowup = 2usize;
+        let columns: Vec<Vec<F>> = (0..3)
+            .map(|c| (0..trace_len).map(|i| F::from((c * 17 + i) as u64)).collect())
+            .collect();
+        let plain = lde_trace_columns(&columns, trace_len, blowup).unwrap();
+        let masked = lde_trace_columns_masked(&columns, trace_len, blowup, &[], 8, 999).unwrap();
+        assert_eq!(plain, masked, "empty mask_cols must equal the default LDE exactly");
+        let _ = F::ONE;
+    }
+}
+
 #[cfg(test)]
 mod starkware_tests {
     use super::*;

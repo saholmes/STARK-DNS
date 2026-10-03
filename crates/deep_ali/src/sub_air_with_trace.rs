@@ -350,6 +350,454 @@ pub fn prove_one_sub_air_with_trace(
     }
 }
 
+/// Zero-knowledge (hidden-amount) variant of [`prove_one_sub_air_with_trace`].
+///
+/// Identical to the base prover except the trace LDE is built with
+/// [`crate::trace_import::lde_trace_columns_masked`]: every column in
+/// `mask_cols` gets a random `r*Z_H` mask (degree `< mask_deg`) added before
+/// the LDE.  Because `Z_H` vanishes on the trace rows, the committed trace
+/// root, the FRI quotient (`c_eval` over the masked LDE) and the opened cells
+/// are all internally consistent, so **the existing
+/// [`verify_one_sub_air_with_trace`] verifies these proofs with no change**.
+///
+/// Properties (for a LINEAR AIR such as conservation):
+/// - **Soundness preserved.** The mask is zero on the trace rows, so the real
+///   witness is unchanged; if the trace violates the constraint, `C` is not
+///   divisible by `Z_H` and `C + r'*Z_H` still isn't -> FRI's low-degree test
+///   rejects. Masking cannot rescue a false statement.
+/// - **Hiding.** The opened cells for masked columns are the trace value plus a
+///   fresh uniform term off the trace domain; with `mask_deg >= n_queries`
+///   every opened masked cell is independently blinded. Distinct `seed`s give
+///   independent proofs of the same statement (the two-witness basis).
+///
+/// `mask_cols = []` reproduces [`prove_one_sub_air_with_trace`] bit-for-bit.
+#[allow(clippy::too_many_arguments)]
+pub fn prove_one_sub_air_with_trace_zk(
+    trace: &[Vec<F>],
+    n_trace: usize,
+    blowup: usize,
+    pi_hash: [u8; 32],
+    domain_sep: &[u8],
+    num_constraints: usize,
+    mask_cols: &[usize],
+    mask_deg: usize,
+    seed: u64,
+    c_eval_fn: impl FnOnce(&[Vec<F>], usize, usize, &[F]) -> Vec<F>,
+    fri_params_fn: impl FnOnce(usize, [u8; 32]) -> crate::fri::DeepFriParams,
+) -> SubAirProofWithTrace {
+    let n0 = n_trace * blowup;
+    let lde = crate::trace_import::lde_trace_columns_masked(
+        trace, n_trace, blowup, mask_cols, mask_deg, seed,
+    )
+    .expect("masked LDE construction");
+
+    // 1. Commit trace LDE (masked).
+    let (trace_root, tree) = commit_trace_lde(&lde, domain_sep);
+
+    // 2. Augment pi_hash so FRI's FS challenges depend on trace_root.
+    let aug_pi_hash = augment_pi_hash(&pi_hash, &trace_root, domain_sep);
+
+    // 3. Derive comb_coeffs from aug_pi_hash (binds trace_root before α).
+    let comb_coeffs = comb_coeffs_aug(num_constraints, &aug_pi_hash, domain_sep);
+
+    // 4. Compute c_eval over the MASKED LDE and run FRI under aug_pi_hash.
+    let c_eval = c_eval_fn(&lde, n_trace, blowup, &comb_coeffs);
+    let domain = FriDomain::new_radix2(n0);
+    let params = fri_params_fn(n0, aug_pi_hash);
+    let fri_proof = deep_fri_prove::<Ext>(c_eval, domain, &params);
+
+    // 5. Open trace at each queried position (masked cells off the trace rows).
+    let positions = extract_query_positions(&fri_proof)
+        .expect("FRI/STIR proof has at least one query position");
+    let n_queries = positions.len();
+    let mut openings_cur = Vec::with_capacity(n_queries);
+    let mut openings_nxt = Vec::with_capacity(n_queries);
+    let width = lde.len();
+    for &pos in &positions {
+        let nxt_pos = (pos + blowup) % n0;
+        let cur_cells: Vec<F> = (0..width).map(|c| lde[c][pos]).collect();
+        let nxt_cells: Vec<F> = (0..width).map(|c| lde[c][nxt_pos]).collect();
+        openings_cur.push(TraceOpening { cells: cur_cells, merkle: tree.open(pos) });
+        openings_nxt.push(TraceOpening { cells: nxt_cells, merkle: tree.open(nxt_pos) });
+    }
+
+    SubAirProofWithTrace {
+        fri_proof_bytes: serialize_fri(&fri_proof),
+        trace_root,
+        openings_cur,
+        openings_nxt,
+    }
+}
+
+/// Coset (full-hiding) prover. Builds the masked trace LDE on the COSET `coset_offset · H_{n0}` via
+/// [`crate::trace_import::lde_trace_columns_masked_coset`], so no committed/opened point is ever a trace
+/// row. The caller supplies a `c_eval_fn` running a GLOBAL (ungated) coset merge
+/// ([`crate::deep_ali_merge_global_coset`]) with the same `coset_offset`, and checks the proof with
+/// [`verify_one_sub_air_with_trace_global_coset`]. FRI is unchanged (the coset codeword `[q(η·ω^i)]` is
+/// the subgroup LDE of `q(η·X)`, same degree). Hiding is sound ONLY for a global-polynomial AIR (§4ter).
+#[allow(clippy::too_many_arguments)]
+pub fn prove_one_sub_air_with_trace_zk_coset(
+    trace: &[Vec<F>],
+    n_trace: usize,
+    blowup: usize,
+    pi_hash: [u8; 32],
+    domain_sep: &[u8],
+    num_constraints: usize,
+    mask_cols: &[usize],
+    mask_deg: usize,
+    seed: u64,
+    coset_offset: F,
+    c_eval_fn: impl FnOnce(&[Vec<F>], usize, usize, &[F]) -> Vec<F>,
+    fri_params_fn: impl FnOnce(usize, [u8; 32]) -> crate::fri::DeepFriParams,
+) -> SubAirProofWithTrace {
+    let n0 = n_trace * blowup;
+    let lde = crate::trace_import::lde_trace_columns_masked_coset(
+        trace, n_trace, blowup, mask_cols, mask_deg, seed, coset_offset,
+    )
+    .expect("masked coset LDE construction");
+
+    let (trace_root, tree) = commit_trace_lde(&lde, domain_sep);
+    let aug_pi_hash = augment_pi_hash(&pi_hash, &trace_root, domain_sep);
+    let comb_coeffs = comb_coeffs_aug(num_constraints, &aug_pi_hash, domain_sep);
+
+    let c_eval = c_eval_fn(&lde, n_trace, blowup, &comb_coeffs);
+    let domain = FriDomain::new_radix2(n0);
+    let params = fri_params_fn(n0, aug_pi_hash);
+    let fri_proof = deep_fri_prove::<Ext>(c_eval, domain, &params);
+
+    let positions = extract_query_positions(&fri_proof)
+        .expect("FRI/STIR proof has at least one query position");
+    let n_queries = positions.len();
+    let mut openings_cur = Vec::with_capacity(n_queries);
+    let mut openings_nxt = Vec::with_capacity(n_queries);
+    let width = lde.len();
+    for &pos in &positions {
+        let nxt_pos = (pos + blowup) % n0;
+        let cur_cells: Vec<F> = (0..width).map(|c| lde[c][pos]).collect();
+        let nxt_cells: Vec<F> = (0..width).map(|c| lde[c][nxt_pos]).collect();
+        openings_cur.push(TraceOpening { cells: cur_cells, merkle: tree.open(pos) });
+        openings_nxt.push(TraceOpening { cells: nxt_cells, merkle: tree.open(nxt_pos) });
+    }
+
+    SubAirProofWithTrace {
+        fri_proof_bytes: serialize_fri(&fri_proof),
+        trace_root,
+        openings_cur,
+        openings_nxt,
+    }
+}
+
+/// GLOBAL (ungated) coset verifier — counterpart to [`prove_one_sub_air_with_trace_zk_coset`].
+///
+/// Checks the AIR identity `c_eval(x)·Z_H(x) = phi(x)` at the COSET point `x = coset_offset · ω^pos` for
+/// EVERY query (no last-row skip — a global cyclic constraint is enforced on all rows). `eval_global`
+/// takes only `(cur, nxt)` (no row index). Since the coset is disjoint from the trace subgroup, `Z_H ≠ 0`
+/// at every opened point, so every opened cell is a masked (hidden) value.
+#[allow(clippy::too_many_arguments)]
+pub fn verify_one_sub_air_with_trace_global_coset(
+    proof: &SubAirProofWithTrace,
+    n_trace: usize,
+    blowup: usize,
+    pi_hash: [u8; 32],
+    domain_sep: &[u8],
+    width: usize,
+    num_constraints: usize,
+    coset_offset: F,
+    eval_global: impl Fn(&[F], &[F]) -> Vec<F>,
+    fri_params_fn: impl Fn(usize, [u8; 32]) -> crate::fri::DeepFriParams,
+) -> Result<(), String> {
+    let n0 = n_trace * blowup;
+    let aug_pi_hash = augment_pi_hash(&pi_hash, &proof.trace_root, domain_sep);
+
+    let fri_proof = deserialize_fri(&proof.fri_proof_bytes)?;
+    let params = fri_params_fn(n0, aug_pi_hash);
+    if !deep_fri_verify::<Ext>(&params, &fri_proof) {
+        return Err("FRI verify rejected".into());
+    }
+
+    let positions = extract_query_positions(&fri_proof)?;
+    let n_queries = positions.len();
+    let m0 = params.schedule.first().copied().unwrap_or(2);
+
+    let comb_coeffs = comb_coeffs_aug(num_constraints, &aug_pi_hash, domain_sep);
+    if comb_coeffs.len() != num_constraints {
+        return Err(format!(
+            "comb_coeffs length {} ≠ num_constraints {num_constraints}",
+            comb_coeffs.len()
+        ));
+    }
+
+    if proof.openings_cur.len() != n_queries || proof.openings_nxt.len() != n_queries {
+        return Err(format!(
+            "trace openings count mismatch: cur={} nxt={} expected={n_queries}",
+            proof.openings_cur.len(), proof.openings_nxt.len()
+        ));
+    }
+
+    let cfg = trace_tree_cfg(n0);
+    let tag = trace_tree_tag(n0, width, domain_sep);
+
+    for k in 0..n_queries {
+        let (pos, c_eval_at_pos) = extract_query_position_and_c_eval(&fri_proof, k, n0, m0)?;
+        debug_assert_eq!(pos, positions[k]);
+        let nxt_pos = (pos + blowup) % n0;
+
+        let cur_op = &proof.openings_cur[k];
+        let nxt_op = &proof.openings_nxt[k];
+        if cur_op.cells.len() != width || nxt_op.cells.len() != width {
+            return Err(format!(
+                "query {k}: cells len mismatch (cur={}, nxt={}, expected={width})",
+                cur_op.cells.len(), nxt_op.cells.len()
+            ));
+        }
+        if cur_op.merkle.index != pos {
+            return Err(format!("query {k}: cur Merkle index {} ≠ FRI position {pos}", cur_op.merkle.index));
+        }
+        if nxt_op.merkle.index != nxt_pos {
+            return Err(format!("query {k}: nxt Merkle index {} ≠ expected {nxt_pos}", nxt_op.merkle.index));
+        }
+
+        let cur_leaf = compute_leaf_hash(&cfg, pos, &cur_op.cells);
+        if cur_leaf != cur_op.merkle.leaf {
+            return Err(format!("query {k}: cur cells hash ≠ committed leaf"));
+        }
+        let nxt_leaf = compute_leaf_hash(&cfg, nxt_pos, &nxt_op.cells);
+        if nxt_leaf != nxt_op.merkle.leaf {
+            return Err(format!("query {k}: nxt cells hash ≠ committed leaf"));
+        }
+
+        if !MerkleTreeChannel::verify_opening(&cfg, proof.trace_root, &cur_op.merkle, &tag) {
+            return Err(format!("query {k}: cur trace Merkle path failed"));
+        }
+        if !MerkleTreeChannel::verify_opening(&cfg, proof.trace_root, &nxt_op.merkle, &tag) {
+            return Err(format!("query {k}: nxt trace Merkle path failed"));
+        }
+
+        // Global constraint: enforced at EVERY query (no last-row skip).
+        let cvals = eval_global(&cur_op.cells, &nxt_op.cells);
+        if cvals.len() != num_constraints {
+            return Err(format!(
+                "query {k}: eval_global returned {} ≠ {num_constraints} constraints",
+                cvals.len()
+            ));
+        }
+        let phi_at_pos: F = (0..num_constraints).map(|j| comb_coeffs[j] * cvals[j]).sum();
+
+        // COSET geometric point x = coset_offset · ω^pos (Z_H(x) ≠ 0).
+        let pos_f = coset_offset * lde_omega_pow(pos, n0);
+        let z_h = z_h_at(pos_f, n_trace);
+        let lhs = c_eval_at_pos * Ext::from_fp(z_h);
+        let rhs = Ext::from_fp(phi_at_pos);
+        if lhs != rhs {
+            return Err(format!(
+                "query {k} (pos={pos}): global constraint mismatch (coset).\n  c_eval·Z_H = {lhs:?}\n  phi = {rhs:?}"
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+/// Per-constraint VANISHING-DOMAIN global coset verifier (path-A) — counterpart to
+/// [`crate::deep_ali_merge_vanishing_coset`]. Each constraint `C_j` is enforced only on its vanishing set
+/// `vanishing_sets[j]` by multiplying it by the complement-vanishing `Z_H(x)/Z_{V_j}(x)` at the coset
+/// point, so the identity checked is `Σ_j cc_j·C_j(x)·(Z_H/Z_{V_j})(x) = c_eval(x)·Z_H(x)`. `eval_global`
+/// returns the raw `C_j` (row-independent). Hiding: the coset point `x = coset_offset·ω^pos` is never a
+/// trace row, so opened cells are masked.
+#[allow(clippy::too_many_arguments)]
+pub fn verify_one_sub_air_with_trace_vanishing_coset(
+    proof: &SubAirProofWithTrace,
+    n_trace: usize,
+    blowup: usize,
+    pi_hash: [u8; 32],
+    domain_sep: &[u8],
+    width: usize,
+    num_constraints: usize,
+    coset_offset: F,
+    vanishing_sets: &[Vec<usize>],
+    eval_global: impl Fn(&[F], &[F]) -> Vec<F>,
+    fri_params_fn: impl Fn(usize, [u8; 32]) -> crate::fri::DeepFriParams,
+) -> Result<(), String> {
+    let n0 = n_trace * blowup;
+    let aug_pi_hash = augment_pi_hash(&pi_hash, &proof.trace_root, domain_sep);
+
+    let fri_proof = deserialize_fri(&proof.fri_proof_bytes)?;
+    let params = fri_params_fn(n0, aug_pi_hash);
+    if !deep_fri_verify::<Ext>(&params, &fri_proof) {
+        return Err("FRI verify rejected".into());
+    }
+
+    let positions = extract_query_positions(&fri_proof)?;
+    let n_queries = positions.len();
+    let m0 = params.schedule.first().copied().unwrap_or(2);
+
+    let comb_coeffs = comb_coeffs_aug(num_constraints, &aug_pi_hash, domain_sep);
+    if comb_coeffs.len() != num_constraints || vanishing_sets.len() != num_constraints {
+        return Err("comb_coeffs / vanishing_sets length ≠ num_constraints".into());
+    }
+    if proof.openings_cur.len() != n_queries || proof.openings_nxt.len() != n_queries {
+        return Err("trace openings count mismatch".into());
+    }
+
+    let cfg = trace_tree_cfg(n0);
+    let tag = trace_tree_tag(n0, width, domain_sep);
+
+    for k in 0..n_queries {
+        let (pos, c_eval_at_pos) = extract_query_position_and_c_eval(&fri_proof, k, n0, m0)?;
+        debug_assert_eq!(pos, positions[k]);
+        let nxt_pos = (pos + blowup) % n0;
+
+        let cur_op = &proof.openings_cur[k];
+        let nxt_op = &proof.openings_nxt[k];
+        if cur_op.cells.len() != width || nxt_op.cells.len() != width {
+            return Err(format!("query {k}: cells len mismatch"));
+        }
+        if cur_op.merkle.index != pos || nxt_op.merkle.index != nxt_pos {
+            return Err(format!("query {k}: Merkle index mismatch"));
+        }
+        if compute_leaf_hash(&cfg, pos, &cur_op.cells) != cur_op.merkle.leaf
+            || compute_leaf_hash(&cfg, nxt_pos, &nxt_op.cells) != nxt_op.merkle.leaf
+        {
+            return Err(format!("query {k}: cells hash ≠ committed leaf"));
+        }
+        if !MerkleTreeChannel::verify_opening(&cfg, proof.trace_root, &cur_op.merkle, &tag)
+            || !MerkleTreeChannel::verify_opening(&cfg, proof.trace_root, &nxt_op.merkle, &tag)
+        {
+            return Err(format!("query {k}: trace Merkle path failed"));
+        }
+
+        let cvals = eval_global(&cur_op.cells, &nxt_op.cells);
+        if cvals.len() != num_constraints {
+            return Err(format!("query {k}: eval_global returned {} ≠ {num_constraints}", cvals.len()));
+        }
+        // x = coset_offset · ω^pos; enforce each C_j only on V_j via the complement-vanishing multiplier.
+        let pos_f = coset_offset * lde_omega_pow(pos, n0);
+        let phi_at_pos: F = (0..num_constraints)
+            .map(|j| {
+                let mult = crate::complement_vanishing_multiplier(pos_f, n_trace, &vanishing_sets[j]);
+                comb_coeffs[j] * cvals[j] * mult
+            })
+            .sum();
+
+        let z_h = z_h_at(pos_f, n_trace);
+        let lhs = c_eval_at_pos * Ext::from_fp(z_h);
+        let rhs = Ext::from_fp(phi_at_pos);
+        if lhs != rhs {
+            return Err(format!(
+                "query {k} (pos={pos}): vanishing-coset constraint mismatch.\n  c_eval·Z_H = {lhs:?}\n  phi = {rhs:?}"
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+/// Vanishing-coset verifier with PUBLIC-column binding — like
+/// [`verify_one_sub_air_with_trace_vanishing_coset`], but for designated columns the verifier does NOT
+/// trust the committed/opened cells (which a prover could forge); instead it OVERRIDES them with its own
+/// `public_overrides[j] = (col_index, public_coset_lde)` (the coset-LDE of a PUBLIC polynomial, length n0,
+/// computed by the verifier) before recomputing `phi`. If a prover used forged values for those columns in
+/// its `c_eval`, the recomputed `phi` (with the true public values) mismatches `c_eval·Z_H` ⇒ reject.
+///
+/// Used to bind the Keccak `RC` columns to the real public round constants: a prover who forges `RC`
+/// (committing to a different hash) is rejected, closing the §12bis soundness gap.
+#[allow(clippy::too_many_arguments)]
+pub fn verify_one_sub_air_with_trace_vanishing_coset_public(
+    proof: &SubAirProofWithTrace,
+    n_trace: usize,
+    blowup: usize,
+    pi_hash: [u8; 32],
+    domain_sep: &[u8],
+    width: usize,
+    num_constraints: usize,
+    coset_offset: F,
+    vanishing_sets: &[Vec<usize>],
+    public_overrides: &[(usize, Vec<F>)],
+    eval_global: impl Fn(&[F], &[F]) -> Vec<F>,
+    fri_params_fn: impl Fn(usize, [u8; 32]) -> crate::fri::DeepFriParams,
+) -> Result<(), String> {
+    let n0 = n_trace * blowup;
+    let aug_pi_hash = augment_pi_hash(&pi_hash, &proof.trace_root, domain_sep);
+
+    let fri_proof = deserialize_fri(&proof.fri_proof_bytes)?;
+    let params = fri_params_fn(n0, aug_pi_hash);
+    if !deep_fri_verify::<Ext>(&params, &fri_proof) {
+        return Err("FRI verify rejected".into());
+    }
+    let positions = extract_query_positions(&fri_proof)?;
+    let n_queries = positions.len();
+    let m0 = params.schedule.first().copied().unwrap_or(2);
+    let comb_coeffs = comb_coeffs_aug(num_constraints, &aug_pi_hash, domain_sep);
+    if comb_coeffs.len() != num_constraints || vanishing_sets.len() != num_constraints {
+        return Err("comb_coeffs / vanishing_sets length ≠ num_constraints".into());
+    }
+    if proof.openings_cur.len() != n_queries || proof.openings_nxt.len() != n_queries {
+        return Err("trace openings count mismatch".into());
+    }
+    for (c, lde) in public_overrides {
+        if *c >= width {
+            return Err(format!("public override col {c} ≥ width {width}"));
+        }
+        if lde.len() != n0 {
+            return Err(format!("public override col {c}: lde len {} ≠ n0 {n0}", lde.len()));
+        }
+    }
+
+    let cfg = trace_tree_cfg(n0);
+    let tag = trace_tree_tag(n0, width, domain_sep);
+
+    for k in 0..n_queries {
+        let (pos, c_eval_at_pos) = extract_query_position_and_c_eval(&fri_proof, k, n0, m0)?;
+        debug_assert_eq!(pos, positions[k]);
+        let nxt_pos = (pos + blowup) % n0;
+
+        let cur_op = &proof.openings_cur[k];
+        let nxt_op = &proof.openings_nxt[k];
+        if cur_op.cells.len() != width || nxt_op.cells.len() != width {
+            return Err(format!("query {k}: cells len mismatch"));
+        }
+        if cur_op.merkle.index != pos || nxt_op.merkle.index != nxt_pos {
+            return Err(format!("query {k}: Merkle index mismatch"));
+        }
+        if compute_leaf_hash(&cfg, pos, &cur_op.cells) != cur_op.merkle.leaf
+            || compute_leaf_hash(&cfg, nxt_pos, &nxt_op.cells) != nxt_op.merkle.leaf
+        {
+            return Err(format!("query {k}: cells hash ≠ committed leaf"));
+        }
+        if !MerkleTreeChannel::verify_opening(&cfg, proof.trace_root, &cur_op.merkle, &tag)
+            || !MerkleTreeChannel::verify_opening(&cfg, proof.trace_root, &nxt_op.merkle, &tag)
+        {
+            return Err(format!("query {k}: trace Merkle path failed"));
+        }
+
+        // OVERRIDE the designated public columns with the verifier's own public coset-LDE values — do NOT
+        // trust the opened cells for these columns.
+        let mut cur_cells = cur_op.cells.clone();
+        let mut nxt_cells = nxt_op.cells.clone();
+        for (c, lde) in public_overrides {
+            cur_cells[*c] = lde[pos];
+            nxt_cells[*c] = lde[nxt_pos];
+        }
+
+        let cvals = eval_global(&cur_cells, &nxt_cells);
+        if cvals.len() != num_constraints {
+            return Err(format!("query {k}: eval_global returned {} ≠ {num_constraints}", cvals.len()));
+        }
+        let pos_f = coset_offset * lde_omega_pow(pos, n0);
+        let phi_at_pos: F = (0..num_constraints)
+            .map(|j| {
+                let mult = crate::complement_vanishing_multiplier(pos_f, n_trace, &vanishing_sets[j]);
+                comb_coeffs[j] * cvals[j] * mult
+            })
+            .sum();
+        let z_h = z_h_at(pos_f, n_trace);
+        if c_eval_at_pos * Ext::from_fp(z_h) != Ext::from_fp(phi_at_pos) {
+            return Err(format!("query {k} (pos={pos}): vanishing-coset(public) constraint mismatch"));
+        }
+    }
+    Ok(())
+}
+
 /// Variant of `prove_one_sub_air_with_trace` that returns the LDE and
 /// the committed Merkle tree alongside the proof.  Use this when the
 /// caller needs to open *additional* trace rows (e.g. cross-region

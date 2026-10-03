@@ -382,6 +382,70 @@ pub fn eval_per_row(cur: &[F], nxt: &[F], row: usize) -> Vec<F> {
     out
 }
 
+// ─── RC-as-column variant (for coset-hidden / path-A proving) ───────
+//
+// The ONLY row-dependent part of the Keccak AIR is the ι round constant `RC[row]`, which makes the
+// composition non-global and breaks a coset LDE (goldilocks-confidential-amounts-scope.md §4ter). This
+// additive variant removes that row-dependence by reading the ι constant from 64 `RC` COLUMNS (bit b of
+// lane (0,0)'s round constant), so every constraint is a GLOBAL polynomial relation — enabling a
+// coset-hidden proof via `deep_ali_merge_vanishing_coset`. It ALSO emits the chaining transition
+// UNGATED (on every row); the caller enforces it only on its vanishing set
+// `V = all rows except {ROUNDS-1, n_trace-1}` (round ROUNDS-1's digest doesn't chain to the zero pad; the
+// last row doesn't wrap to the round-0 input).
+
+/// Width of the trace this variant expects: the standard round columns plus 64 `RC` bit-columns.
+pub const ROUND_WIDTH_RC: usize = ROUND_WIDTH + LANE_BITS;
+/// Base column index of the 64 `RC` bit-columns (bit b of lane (0,0)'s round constant).
+pub const RC_COL_BASE: usize = ROUND_WIDTH;
+
+/// Fill the 64 `RC` columns: `rc_col[b][r] = bit b of RC[r]` for r < ROUNDS, else 0 (padding rows).
+/// Call after [`fill_trace`] on a trace of width [`ROUND_WIDTH_RC`].
+pub fn fill_rc_columns(trace: &mut [Vec<F>], n_trace: usize) {
+    assert_eq!(trace.len(), ROUND_WIDTH_RC, "trace must have ROUND_WIDTH_RC columns");
+    for r in 0..n_trace {
+        let rc = if r < ROUNDS { RC[r] } else { 0u64 };
+        for b in 0..LANE_BITS {
+            trace[RC_COL_BASE + b][r] = F::from((rc >> b) & 1);
+        }
+    }
+}
+
+/// RC-as-column, globally-evaluable Keccak constraints (ι from the RC columns; chaining UNGATED).
+///
+/// Equivalent to [`eval_per_row`] on the active rounds (rows 0..ROUNDS-1) when the RC columns hold the
+/// correct bits — but with NO `row` dependence, so the composition is a global polynomial. `cur`/`nxt`
+/// have width [`ROUND_WIDTH_RC`]. The returned vector is: all of [`eval_per_row`]'s constraints with the
+/// ι lane-(0,0) block replaced by the RC-column field-XOR, followed by the 1600 chaining constraints
+/// (always emitted). The caller supplies the matching vanishing sets to
+/// `deep_ali_merge_vanishing_coset` (round/ι constraints on `V = all rows`; chaining on
+/// `V = all rows except {ROUNDS-1, n_trace-1}`).
+pub fn eval_per_row_rc_col(cur: &[F], nxt: &[F], n_trace: usize) -> Vec<F> {
+    // `row = ROUNDS` ⇒ eval_per_row uses rc = 0 for ι and emits NO chaining — we fix both up below.
+    let mut out = eval_per_row(cur, nxt, ROUNDS);
+
+    // ι lane-(0,0) block offset: after §1 bit-bool (ROUND_WIDTH) + §2 θ-tree (4·5·64) + §3 θ-rot (5·64)
+    // + §4 θ-apply + §5 ρπ + §6 χ-aux + §7 χ-apply (each 25·64).
+    let iota00_base = ROUND_WIDTH + 4 * 5 * LANE_BITS + 5 * LANE_BITS + 4 * (25 * LANE_BITS);
+    debug_assert_eq!(
+        out.len(),
+        iota00_base + LANE_BITS + 24 * LANE_BITS,
+        "eval_per_row layout changed — eval_per_row_rc_col offset needs updating"
+    );
+    // Replace the ι lane-(0,0) constraints (currently `pi − pc`, rc=0) with the RC-COLUMN field-XOR.
+    for b in 0..LANE_BITS {
+        let pc = cur[post_chi_col(0, 0, b)];
+        let pi = cur[post_iota_col(0, 0, b)];
+        let rc_b = cur[RC_COL_BASE + b];
+        out[iota00_base + b] = xor_constraint(pc, rc_b, pi);
+    }
+    // Append chaining UNGATED: state_in of next row = post_iota of current row (1600 constraints).
+    let _ = n_trace;
+    for c_off in 0..STATE_BITS {
+        out.push(nxt[cols::STATE_IN_BASE + c_off] - cur[cols::POST_IOTA_BASE + c_off]);
+    }
+    out
+}
+
 // ─── Tests ─────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -391,6 +455,53 @@ mod tests {
 
     fn fresh_trace(n_trace: usize) -> Vec<Vec<F>> {
         (0..ROUND_WIDTH).map(|_| vec![F::zero(); n_trace]).collect()
+    }
+
+    /// The RC-as-column variant: on an honest trace (+ RC columns) it is satisfied on the active rounds
+    /// 0..ROUNDS-1, and its UNGATED chaining is nonzero at the boundary rows {ROUNDS-1, n_trace-1}
+    /// (handled by the vanishing set in the path-A merge, not by the eval being zero).
+    #[test]
+    fn eval_per_row_rc_col_honest_and_ungated_chaining() {
+        let mut initial = [0u64; NUM_LANES];
+        initial[0] = 0xFEED_FACE_F00D_BABE;
+        initial[7] = 0xDEAD_BEEF_0000_0001;
+        let n_trace = 32;
+
+        // Standard round trace, then append + fill the 64 RC columns.
+        let mut trace: Vec<Vec<F>> = (0..ROUND_WIDTH).map(|_| vec![F::zero(); n_trace]).collect();
+        fill_trace(&mut trace, n_trace, &initial);
+        trace.extend((0..LANE_BITS).map(|_| vec![F::zero(); n_trace]));
+        assert_eq!(trace.len(), ROUND_WIDTH_RC);
+        fill_rc_columns(&mut trace, n_trace);
+
+        let row_vec = |r: usize| -> Vec<F> { (0..ROUND_WIDTH_RC).map(|c| trace[c][r]).collect() };
+        let chaining_start = |len: usize| len - STATE_BITS; // chaining is the last STATE_BITS entries
+
+        // Active rounds 0..ROUNDS-1: every constraint (incl. chaining to the next round) must vanish.
+        for r in 0..ROUNDS - 1 {
+            let cur = row_vec(r);
+            let nxt = row_vec(r + 1);
+            let cvals = eval_per_row_rc_col(&cur, &nxt, n_trace);
+            assert!(
+                cvals.iter().all(|v| v.is_zero()),
+                "RC-col eval nonzero on honest active round {r}"
+            );
+        }
+
+        // Row ROUNDS-1 (=23): round constraints vanish, but the UNGATED chaining to the zero pad does NOT.
+        let cur = row_vec(ROUNDS - 1);
+        let nxt = row_vec(ROUNDS); // zero pad
+        let cvals = eval_per_row_rc_col(&cur, &nxt, n_trace);
+        let cs = chaining_start(cvals.len());
+        assert!(cvals[..cs].iter().all(|v| v.is_zero()), "non-chaining constraints must vanish at row 23");
+        assert!(cvals[cs..].iter().any(|v| !v.is_zero()), "chaining must be NONZERO at row 23 (digest ≠ pad)");
+
+        // Last row (31) wrapping to row 0: chaining nonzero (pad ≠ round-0 input).
+        let cur = row_vec(n_trace - 1);
+        let nxt = row_vec(0);
+        let cvals = eval_per_row_rc_col(&cur, &nxt, n_trace);
+        let cs = chaining_start(cvals.len());
+        assert!(cvals[cs..].iter().any(|v| !v.is_zero()), "chaining must be NONZERO at the last row (wrap)");
     }
 
     /// Honest trace from a known-good input: every constraint must hold.
